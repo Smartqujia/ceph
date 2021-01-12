@@ -1,8 +1,6 @@
 /*
  * rbd-fuse
  */
-#define FUSE_USE_VERSION 30
-
 #include "include/int_types.h"
 
 #include <stdio.h>
@@ -11,7 +9,6 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <fuse.h>
 #include <pthread.h>
 #include <string.h>
 #include <sys/types.h>
@@ -32,12 +29,14 @@
 
 #include "common/ceph_argparse.h"
 #include "common/ceph_context.h"
+#include "include/ceph_fuse.h"
 
 #include "global/global_init.h"
 #include "global/global_context.h"
 
 static int gotrados = 0;
 char *pool_name;
+char *nspace_name;
 char *mount_image_name;
 rados_t cluster;
 rados_ioctx_t ioctx;
@@ -51,6 +50,7 @@ struct rbd_stat {
 
 struct rbd_options {
 	char *pool_name;
+	char *nspace_name;
 	char *image_name;
 };
 
@@ -59,8 +59,9 @@ struct rbd_image {
 	struct rbd_image *next;
 };
 struct rbd_image_data {
-    struct rbd_image *images;
-    void *buf;
+	struct rbd_image *images;
+	rbd_image_spec_t *image_specs;
+	size_t image_spec_count;
 };
 struct rbd_image_data rbd_image_data;
 
@@ -72,7 +73,7 @@ struct rbd_openimage {
 #define MAX_RBD_IMAGES		128
 struct rbd_openimage opentbl[MAX_RBD_IMAGES];
 
-struct rbd_options rbd_options = {(char*) "rbd", NULL};
+struct rbd_options rbd_options = {(char*) "rbd", (char*) "", NULL};
 
 #define rbdsize(fd)	opentbl[fd].rbd_stat.rbd_info.size
 #define rbdblksize(fd)	opentbl[fd].rbd_stat.rbd_info.obj_size
@@ -97,10 +98,7 @@ void
 enumerate_images(struct rbd_image_data *data)
 {
 	struct rbd_image **head = &data->images;
-	char *ibuf = NULL;
-	size_t ibuf_len = 0;
 	struct rbd_image *im, *next;
-	char *ip;
 	int ret;
 
 	if (*head != NULL) {
@@ -110,45 +108,44 @@ enumerate_images(struct rbd_image_data *data)
 			im = next;
 		}
 		*head = NULL;
-		free(data->buf);
-		data->buf = NULL;
+		rbd_image_spec_list_cleanup(data->image_specs,
+					    data->image_spec_count);
+		free(data->image_specs);
+		data->image_specs = NULL;
+		data->image_spec_count = 0;
 	}
 
-	ret = rbd_list(ioctx, ibuf, &ibuf_len);
-	if (ret == -ERANGE) {
-		ceph_assert(ibuf_len > 0);
-		ibuf = (char*) malloc(ibuf_len);
-		if (!ibuf) {
-			simple_err("Failed to get ibuf", -ENOMEM);
-			return;
+	while (true) {
+		ret = rbd_list2(ioctx, data->image_specs,
+				&data->image_spec_count);
+		if (ret == -ERANGE) {
+			data->image_specs = static_cast<rbd_image_spec_t *>(
+				realloc(data->image_specs,
+					sizeof(rbd_image_spec_t) * data->image_spec_count));
+		} else if (ret < 0) {
+			simple_err("Failed to list images", ret);
+		} else {
+			break;
 		}
-	} else if (ret < 0) {
-		simple_err("Failed to get ibuf_len", ret);
-		return;
 	}
 
-	ret = rbd_list(ioctx, ibuf, &ibuf_len);
-	if (ret < 0) {
-		simple_err("Failed to populate ibuf", ret);
-		free(ibuf);
-		return;
+	if (*nspace_name != '\0') {
+	    fprintf(stderr, "pool/namespace %s/%s: ", pool_name, nspace_name);
+	} else {
+	    fprintf(stderr, "pool %s: ", pool_name);
 	}
-	ceph_assert(ret == (int)ibuf_len);
-
-	fprintf(stderr, "pool %s: ", pool_name);
-	for (ip = ibuf; ip < &ibuf[ibuf_len]; ip += strlen(ip) + 1)  {
+	for (size_t idx = 0; idx < data->image_spec_count; ++idx) {
 		if ((mount_image_name == NULL) ||
 		    ((strlen(mount_image_name) > 0) &&
-		    (strcmp(ip, mount_image_name) == 0))) {
-			fprintf(stderr, "%s, ", ip);
+		    (strcmp(data->image_specs[idx].name, mount_image_name) == 0))) {
+			fprintf(stderr, "%s, ", data->image_specs[idx].name);
 			im = static_cast<rbd_image*>(malloc(sizeof(*im)));
-			im->image_name = ip;
+			im->image_name = data->image_specs[idx].name;
 			im->next = *head;
 			*head = im;
 		}
 	}
 	fprintf(stderr, "\n");
-	data->buf = ibuf;
 }
 
 int
@@ -245,7 +242,11 @@ static int count_images(void)
 
 extern "C" {
 
-static int rbdfs_getattr(const char *path, struct stat *stbuf)
+static int rbdfs_getattr(const char *path, struct stat *stbuf
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 0)
+                         , struct fuse_file_info *fi
+#endif
+                        )
 {
 	int fd;
 	time_t now;
@@ -457,11 +458,15 @@ static void rbdfs_readdir_cb(void *_info, const char *name)
 {
 	struct rbdfs_readdir_info *info = (struct rbdfs_readdir_info*) _info;
 
-	info->filler(info->buf, name, NULL, 0);
+        filler_compat(info->filler, info->buf, name, NULL, 0);
 }
 
 static int rbdfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-			   off_t offset, struct fuse_file_info *fi)
+			 off_t offset, struct fuse_file_info *fi
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 0)
+                         , enum fuse_readdir_flags
+#endif
+                         )
 {
 	struct rbdfs_readdir_info info = { buf, filler };
 
@@ -473,8 +478,8 @@ static int rbdfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	if (strcmp(path, "/") != 0)
 		return -ENOENT;
 
-	filler(buf, ".", NULL, 0);
-	filler(buf, "..", NULL, 0);
+	filler_compat(filler, buf, ".", NULL, 0);
+	filler_compat(filler, buf, "..", NULL, 0);
 	iter_images(&info, rbdfs_readdir_cb);
 
 	return 0;
@@ -489,7 +494,11 @@ static int rbdfs_releasedir(const char *path, struct fuse_file_info *fi)
 }
 
 void *
-rbdfs_init(struct fuse_conn_info *conn)
+rbdfs_init(struct fuse_conn_info *conn
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 0)
+           , struct fuse_config *cfg
+#endif
+          )
 {
 	int ret;
 
@@ -501,13 +510,15 @@ rbdfs_init(struct fuse_conn_info *conn)
 		exit(90);
 
 	pool_name = rbd_options.pool_name;
+	nspace_name = rbd_options.nspace_name;
 	mount_image_name = rbd_options.image_name;
 	ret = rados_ioctx_create(cluster, pool_name, &ioctx);
 	if (ret < 0)
 		exit(91);
-#if FUSE_VERSION >= FUSE_MAKE_VERSION(2, 8)
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(2, 8) && FUSE_VERSION < FUSE_MAKE_VERSION(3, 0)
 	conn->want |= FUSE_CAP_BIG_WRITES;
 #endif
+	rados_ioctx_set_namespace(ioctx, nspace_name);
 	gotrados = 1;
 
 	// init's return value shows up in fuse_context.private_data,
@@ -569,7 +580,11 @@ rbdfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 }
 
 int
-rbdfs_rename(const char *path, const char *destname)
+rbdfs_rename(const char *path, const char *destname
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 0)
+             , unsigned int flags
+#endif
+            )
 {
     int r;
 
@@ -586,7 +601,11 @@ rbdfs_rename(const char *path, const char *destname)
 }
 
 int
-rbdfs_utime(const char *path, struct utimbuf *utime)
+rbdfs_utimens(const char *path, const struct timespec tv[2]
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 0)
+              , struct fuse_file_info *fi
+#endif
+             )
 {
 	// called on create; not relevant
 	return 0;
@@ -608,7 +627,11 @@ rbdfs_unlink(const char *path)
 
 
 int
-rbdfs_truncate(const char *path, off_t size)
+rbdfs_truncate(const char *path, off_t size
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 0)
+               , struct fuse_file_info *fi
+#endif
+              )
 {
 	int fd;
 	int r;
@@ -723,7 +746,9 @@ rbdfs_listxattr(const char *path, char *list, size_t len)
 const static struct fuse_operations rbdfs_oper = {
   getattr:    rbdfs_getattr,
   readlink:   0,
+#if FUSE_VERSION < FUSE_MAKE_VERSION(3, 0)
   getdir:     0,
+#endif
   mknod:      0,
   mkdir:      0,
   unlink:     rbdfs_unlink,
@@ -734,7 +759,9 @@ const static struct fuse_operations rbdfs_oper = {
   chmod:      0,
   chown:      0,
   truncate:   rbdfs_truncate,
-  utime:      rbdfs_utime,
+#if FUSE_VERSION < FUSE_MAKE_VERSION(3, 0)
+  utime:      0,
+#endif
   open:	      rbdfs_open,
   read:	      rbdfs_read,
   write:      rbdfs_write,
@@ -754,6 +781,12 @@ const static struct fuse_operations rbdfs_oper = {
   destroy:    rbdfs_destroy,
   access:     0,
   create:     rbdfs_create,
+#if FUSE_VERSION < FUSE_MAKE_VERSION(3, 0)
+  ftruncate:  0,
+  fgetattr:   0,
+#endif
+  lock:       0,
+  utimens:    rbdfs_utimens,
   /* skip unimplemented */
 };
 
@@ -764,6 +797,8 @@ enum {
 	KEY_VERSION,
 	KEY_RADOS_POOLNAME,
 	KEY_RADOS_POOLNAME_LONG,
+	KEY_RADOS_NSPACENAME,
+	KEY_RADOS_NSPACENAME_LONG,
 	KEY_RBD_IMAGENAME,
 	KEY_RBD_IMAGENAME_LONG
 };
@@ -776,6 +811,9 @@ static struct fuse_opt rbdfs_opts[] = {
 	{"-p %s", offsetof(struct rbd_options, pool_name), KEY_RADOS_POOLNAME},
 	{"--poolname=%s", offsetof(struct rbd_options, pool_name),
 	 KEY_RADOS_POOLNAME_LONG},
+	{"-s %s", offsetof(struct rbd_options, nspace_name), KEY_RADOS_NSPACENAME},
+	{"--namespace=%s", offsetof(struct rbd_options, nspace_name),
+	 KEY_RADOS_NSPACENAME_LONG},
 	{"-r %s", offsetof(struct rbd_options, image_name), KEY_RBD_IMAGENAME},
 	{"--image=%s", offsetof(struct rbd_options, image_name),
 	KEY_RBD_IMAGENAME_LONG},
@@ -792,6 +830,7 @@ static void usage(const char *progname)
 "    -V   --version         print version\n"
 "    -c   --conf            ceph configuration file [/etc/ceph/ceph.conf]\n"
 "    -p   --poolname        rados pool name [rbd]\n"
+"    -s   --namespace       rados namespace name []\n"
 "    -r   --image           RBD image name\n"
 "\n", progname);
 }
@@ -818,6 +857,15 @@ static int rbdfs_opt_proc(void *data, const char *arg, int key,
 			rbd_options.pool_name = NULL;
 		}
 		rbd_options.pool_name = strdup(arg+2);
+		return 0;
+	}
+
+	if (key == KEY_RADOS_NSPACENAME) {
+		if (rbd_options.nspace_name != NULL) {
+			free(rbd_options.nspace_name);
+			rbd_options.nspace_name = NULL;
+		}
+		rbd_options.nspace_name = strdup(arg+2);
 		return 0;
 	}
 
@@ -866,6 +914,8 @@ connect_to_cluster(rados_t *pcluster)
 
 int main(int argc, const char *argv[])
 {
+	memset(&rbd_image_data, 0, sizeof(rbd_image_data));
+
 	// librados will filter out -f/-d options from command-line
 	std::map<std::string, bool> filter_args = {
 		{"-f", false},

@@ -85,12 +85,10 @@ Optional arguments:
 * [--dmcrypt]           Enable encryption for the underlying OSD devices
 * [--crush-device-class] Define a CRUSH device class to assign the OSD to
 * [--no-systemd]         Do not enable or create any systemd units
-* [--report]         Report what the potential outcome would be for the
-                     current input (requires devices to be passed in)
-* [--format]         Output format when reporting (used along with
-                     --report), can be one of 'pretty' (default) or 'json'
-* [--block-db-size]     Set (or override) the "bluestore_block_db_size" value,
-                        in bytes
+* [--osds-per-device]   Provision more than 1 (the default) OSD per device
+* [--report]         Report what the potential outcome would be for the current input (requires devices to be passed in)
+* [--format]         Output format when reporting (used along with --report), can be one of 'pretty' (default) or 'json'
+* [--block-db-size]     Set (or override) the "bluestore_block_db_size" value, in bytes
 * [--journal-size]      Override the "osd_journal_size" value, in megabytes
 
 Required positional arguments:
@@ -213,7 +211,7 @@ Positional arguments:
 
 **zap**
 Zaps the given logical volume or partition. If given a path to a logical
-volume it must be in the format of vg/lv. Any filesystems present
+volume it must be in the format of vg/lv. Any file systems present
 on the given lv or partition will be removed and all data will be purged.
 
 However, the lv or partition will be kept intact.
@@ -225,6 +223,17 @@ Usage, for logical volumes::
 Usage, for logical partitions::
 
       ceph-volume lvm zap /dev/sdc1
+
+For full removal of the device use the ``--destroy`` flag (allowed for all
+device types)::
+
+      ceph-volume lvm zap --destroy /dev/sdc1
+
+Multiple devices can be removed by specifying the OSD ID and/or the OSD FSID::
+
+      ceph-volume lvm zap --destroy --osd-id 1
+      ceph-volume lvm zap --destroy --osd-id 1 --osd-fsid C9605912-8395-4D76-AFC0-7DFDAC315D59
+
 
 Positional arguments:
 
@@ -269,6 +278,10 @@ directory as well.
 
 Optionally, the JSON blob can be sent to stdout for further inspection.
 
+Usage on all running OSDs::
+
+    ceph-volume simple scan
+
 Usage on data devices::
 
     ceph-volume simple scan <data device>
@@ -284,7 +297,7 @@ Optional arguments:
 * [--stdout]            Send the JSON blob to stdout
 * [--force]             If the JSON file exists at destination, overwrite it
 
-Required Positional arguments:
+Optional Positional arguments:
 
 * <DATA DEVICE or OSD DIR>  Actual data partition or a path to the running OSD
 

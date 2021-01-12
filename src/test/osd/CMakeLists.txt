@@ -6,7 +6,7 @@ add_executable(ceph_test_rados
   RadosModel.cc
   )
 target_link_libraries(ceph_test_rados
-  librados-cxx
+  librados
   global
   ${BLKID_LIBRARIES}
   ${CMAKE_DL_LIBS}
@@ -15,6 +15,22 @@ target_link_libraries(ceph_test_rados
   )
 install(TARGETS
   ceph_test_rados
+  DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# test_stale_read
+add_executable(ceph_test_osd_stale_read
+  ceph_test_osd_stale_read.cc
+  )
+target_link_libraries(ceph_test_osd_stale_read
+  librados
+  global
+  ${CMAKE_DL_LIBS}
+  ${EXTRALIBS}
+  ${CMAKE_DL_LIBS}
+  ${UNITTEST_LIBS}
+  )
+install(TARGETS
+  ceph_test_osd_stale_read
   DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # scripts
@@ -97,20 +113,11 @@ add_executable(unittest_ec_transaction
 add_ceph_unittest(unittest_ec_transaction)
 target_link_libraries(unittest_ec_transaction osd global ${BLKID_LIBRARIES})
 
-# unittest_mclock_op_class_queue
-add_executable(unittest_mclock_op_class_queue
-  TestMClockOpClassQueue.cc
+# unittest_mclock_scheduler
+add_executable(unittest_mclock_scheduler
+  TestMClockScheduler.cc
 )
-add_ceph_unittest(unittest_mclock_op_class_queue)
-target_link_libraries(unittest_mclock_op_class_queue
-  global osd dmclock os
-)
-
-# unittest_mclock_client_queue
-add_executable(unittest_mclock_client_queue
-  TestMClockClientQueue.cc
-)
-add_ceph_unittest(unittest_mclock_client_queue)
-target_link_libraries(unittest_mclock_client_queue
+add_ceph_unittest(unittest_mclock_scheduler)
+target_link_libraries(unittest_mclock_scheduler
   global osd dmclock os
 )

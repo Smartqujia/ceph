@@ -1,11 +1,11 @@
 =============
-Influx Plugin 
+Influx Module 
 =============
 
-The influx plugin continuously collects and sends time series data to an
+The influx module continuously collects and sends time series data to an
 influxdb database.
 
-The influx plugin was introduced in the 13.x *Mimic* release.
+The influx module was introduced in the 13.x *Mimic* release.
 
 --------
 Enabling 
@@ -70,7 +70,7 @@ To make use of the debugging option in the module:
     [mgr]
         debug_mgr = 20  
 
-- Use this command ``ceph tell mgr.<mymonitor> influx self-test``.
+- Use this command ``ceph influx self-test``.
 - Check the log files. Users may find it easier to filter the log files using *mgr[influx]*.
 
 --------------------
@@ -87,7 +87,7 @@ Pools
 +---------------+-----------------------------------------------------+
 |Counter        | Description                                         |
 +===============+=====================================================+
-|bytes_used     | Bytes used in the pool not including copies         |
+|stored         | Bytes stored in the pool not including copies       |
 +---------------+-----------------------------------------------------+
 |max_avail      | Max available number of bytes in the pool           |
 +---------------+-----------------------------------------------------+
@@ -99,7 +99,7 @@ Pools
 +---------------+-----------------------------------------------------+
 |rd_bytes       | Number of bytes read in the pool                    |
 +---------------+-----------------------------------------------------+
-|raw_bytes_used | Bytes used in pool including copies made            |
+|stored_raw     | Bytes used in pool including copies made            |
 +---------------+-----------------------------------------------------+
 
 ^^^^

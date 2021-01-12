@@ -5,13 +5,17 @@
 #include "include/rados/librados.hpp"
 #include "common/dout.h"
 #include "common/errno.h"
+#include "common/Cond.h"
 #include "common/Throttle.h"
 #include "cls/rbd/cls_rbd_client.h"
 #include "osd/osd_types.h"
+#include "librbd/AsioEngine.h"
+#include "librbd/ImageCtx.h"
 #include "librbd/Utils.h"
 #include "librbd/api/Config.h"
 #include "librbd/api/Image.h"
 #include "librbd/api/Trash.h"
+#include "librbd/image/ValidatePoolRequest.h"
 
 #define dout_subsys ceph_subsys_rbd
 
@@ -242,9 +246,20 @@ int Pool<I>::init(librados::IoCtx& io_ctx, bool force) {
     return r;
   }
 
-  // TODO configure self-managed snapshots (and other one-time pool checks)
+  ConfigProxy config{cct->_conf};
+  api::Config<I>::apply_pool_overrides(io_ctx, &config);
+  if (!config.get_val<bool>("rbd_validate_pool")) {
+    return 0;
+  }
 
-  return 0;
+  AsioEngine asio_engine(io_ctx);
+
+  C_SaferCond ctx;
+  auto req = image::ValidatePoolRequest<I>::create(
+    io_ctx, asio_engine.get_work_queue(), &ctx);
+  req->send();
+
+  return ctx.wait();
 }
 
 template <typename I>
@@ -281,6 +296,12 @@ int Pool<I>::get_stats(librados::IoCtx& io_ctx, StatOptions* stat_options) {
   uint64_t* max_provisioned_bytes;
   uint64_t* snapshot_count;
 
+  std::vector<trash_image_info_t> trash_entries;
+  int r = Trash<I>::list(io_ctx, trash_entries, false);
+  if (r < 0 && r != -EOPNOTSUPP) {
+    return r;
+  }
+
   get_pool_stat_option_value<I>(
     stat_options, RBD_POOL_STAT_OPTION_IMAGES, &image_count);
   get_pool_stat_option_value<I>(
@@ -294,15 +315,20 @@ int Pool<I>::get_stats(librados::IoCtx& io_ctx, StatOptions* stat_options) {
   if (image_count != nullptr || provisioned_bytes != nullptr ||
       max_provisioned_bytes != nullptr || snapshot_count != nullptr) {
     typename Image<I>::ImageNameToIds images;
-    int r = Image<I>::list_images(io_ctx, &images);
+    int r = Image<I>::list_images_v2(io_ctx, &images);
     if (r < 0) {
       return r;
     }
 
     std::vector<std::string> image_ids;
-    image_ids.reserve(images.size());
+    image_ids.reserve(images.size() + trash_entries.size());
     for (auto& it : images) {
       image_ids.push_back(std::move(it.second));
+    }
+    for (auto& it : trash_entries) {
+      if (it.source == RBD_TRASH_IMAGE_SOURCE_REMOVING) {
+        image_ids.push_back(std::move(it.id));
+      }
     }
 
     r = get_pool_stats<I>(io_ctx, config, image_ids, image_count,
@@ -325,15 +351,13 @@ int Pool<I>::get_stats(librados::IoCtx& io_ctx, StatOptions* stat_options) {
     stat_options, RBD_POOL_STAT_OPTION_TRASH_SNAPSHOTS, &snapshot_count);
   if (image_count != nullptr || provisioned_bytes != nullptr ||
       max_provisioned_bytes != nullptr || snapshot_count != nullptr) {
-    std::vector<trash_image_info_t> trash_entries;
-    int r = Trash<I>::list(io_ctx, trash_entries);
-    if (r < 0 && r != -EOPNOTSUPP) {
-      return r;
-    }
 
     std::vector<std::string> image_ids;
     image_ids.reserve(trash_entries.size());
     for (auto& it : trash_entries) {
+      if (it.source == RBD_TRASH_IMAGE_SOURCE_REMOVING) {
+        continue;
+      }
       image_ids.push_back(std::move(it.id));
     }
 

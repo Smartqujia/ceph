@@ -6,8 +6,8 @@
 
 #include "common/ceph_context.h"
 #include "common/config_obs.h"
-#include "common/Mutex.h"
-#include <dlfcn.h>
+#include "common/ceph_mutex.h"
+#include "include/dlfcn_compat.h"
 
 class TracepointProvider : public md_config_obs_t {
 public:
@@ -73,7 +73,7 @@ private:
   std::string m_library;
   mutable const char* m_config_keys[2];
 
-  Mutex m_lock;
+  ceph::mutex m_lock = ceph::make_mutex("TracepointProvider::m_lock");
   void* m_handle = nullptr;
 
   void verify_config(const ConfigProxy& conf);

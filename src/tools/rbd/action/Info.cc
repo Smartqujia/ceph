@@ -92,6 +92,7 @@ static int do_show_info(librados::IoCtx &io_ctx, librbd::Image& image,
   uint64_t overlap, features, flags, snap_limit;
   bool snap_protected = false;
   librbd::mirror_image_info_t mirror_image;
+  librbd::mirror_image_mode_t mirror_mode = RBD_MIRROR_IMAGE_MODE_JOURNAL;
   std::vector<librbd::snap_info_t> snaps;
   int r;
 
@@ -159,8 +160,14 @@ static int do_show_info(librados::IoCtx &io_ctx, librbd::Image& image,
       return r;
   }
 
-  if (features & RBD_FEATURE_JOURNALING) {
-    r = image.mirror_image_get_info(&mirror_image, sizeof(mirror_image));
+  mirror_image.state = RBD_MIRROR_IMAGE_DISABLED;
+  r = image.mirror_image_get_info(&mirror_image, sizeof(mirror_image));
+  if (r < 0) {
+    return r;
+  }
+
+  if (mirror_image.state != RBD_MIRROR_IMAGE_DISABLED) {
+    r = image.mirror_image_get_mode(&mirror_mode);
     if (r < 0) {
       return r;
     }
@@ -312,37 +319,29 @@ static int do_show_info(librados::IoCtx &io_ctx, librbd::Image& image,
   }
 
   // parent info, if present
-  std::string parent_pool, parent_name, parent_id, parent_snapname;
-  if ((image.parent_info2(&parent_pool, &parent_name, &parent_id,
-                          &parent_snapname) == 0) &&
-      parent_name.length() > 0) {
-
-    librbd::trash_image_info_t trash_image_info;
-    librbd::RBD rbd;
-    r = rbd.trash_get(io_ctx, parent_id.c_str(), &trash_image_info);
-    bool trash_image_info_valid = (r == 0);
-
+  librbd::linked_image_spec_t parent_image_spec;
+  librbd::snap_spec_t parent_snap_spec;
+  if ((image.get_parent(&parent_image_spec, &parent_snap_spec) == 0) &&
+      (parent_image_spec.image_name.length() > 0)) {
     if (f) {
       f->open_object_section("parent");
-      f->dump_string("pool", parent_pool);
-      f->dump_string("image", parent_name);
-      f->dump_string("snapshot", parent_snapname);
-      if (trash_image_info_valid) {
-        f->dump_string("trash", parent_id);
-      }
-      if ((features & RBD_FEATURE_MIGRATING) != 0) {
-        f->dump_bool("migration_source", true);
-      }
+      f->dump_string("pool", parent_image_spec.pool_name);
+      f->dump_string("pool_namespace", parent_image_spec.pool_namespace);
+      f->dump_string("image", parent_image_spec.image_name);
+      f->dump_string("id", parent_image_spec.image_id);
+      f->dump_string("snapshot", parent_snap_spec.name);
+      f->dump_bool("trash", parent_image_spec.trash);
       f->dump_unsigned("overlap", overlap);
       f->close_section();
     } else {
-      std::cout << "\tparent: " << parent_pool << "/" << parent_name
-                << (parent_snapname.empty() ? "" : "@") << parent_snapname;
-      if (trash_image_info_valid) {
-        std::cout << " (trash " << parent_id << ")";
+      std::cout << "\tparent: " << parent_image_spec.pool_name << "/";
+      if (!parent_image_spec.pool_namespace.empty()) {
+        std::cout << parent_image_spec.pool_namespace << "/";
       }
-      if ((features & RBD_FEATURE_MIGRATING) != 0) {
-        std::cout << " (migration source)";
+      std::cout << parent_image_spec.image_name << "@"
+                << parent_snap_spec.name;
+      if (parent_image_spec.trash) {
+        std::cout << " (trash " << parent_image_spec.image_id << ")";
       }
       std::cout << std::endl;
       std::cout << "\toverlap: " << byte_u_t(overlap) << std::endl;
@@ -369,9 +368,12 @@ static int do_show_info(librados::IoCtx &io_ctx, librbd::Image& image,
     }
   }
 
-  if (features & RBD_FEATURE_JOURNALING) {
+  if (features & RBD_FEATURE_JOURNALING ||
+      mirror_image.state != RBD_MIRROR_IMAGE_DISABLED) {
     if (f) {
       f->open_object_section("mirroring");
+      f->dump_string("mode",
+          utils::mirror_image_mode(mirror_mode));
       f->dump_string("state",
           utils::mirror_image_state(mirror_image.state));
       if (mirror_image.state != RBD_MIRROR_IMAGE_DISABLED) {
@@ -383,7 +385,9 @@ static int do_show_info(librados::IoCtx &io_ctx, librbd::Image& image,
       std::cout << "\tmirroring state: "
                 << utils::mirror_image_state(mirror_image.state) << std::endl;
       if (mirror_image.state != RBD_MIRROR_IMAGE_DISABLED) {
-        std::cout << "\tmirroring global id: " << mirror_image.global_id
+        std::cout << "\tmirroring mode: "
+                  << utils::mirror_image_mode(mirror_mode) << std::endl
+                  << "\tmirroring global id: " << mirror_image.global_id
                   << std::endl
                   << "\tmirroring primary: "
                   << (mirror_image.primary ? "true" : "false") <<std::endl;

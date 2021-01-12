@@ -20,13 +20,13 @@ function TEST_reuse_id() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     run_osd $dir 1 || return 1
     run_osd $dir 2 || return 1
 
-    ceph osd pool create foo 2 || return 1
+    ceph osd pool create foo 50 || return 1
     wait_for_clean || return 1
 
     kill_daemons $dir TERM osd.0

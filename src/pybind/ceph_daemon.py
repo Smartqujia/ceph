@@ -15,12 +15,16 @@ import json
 import socket
 import struct
 import time
-from collections import OrderedDict
+try:
+    from collections.abc import OrderedDict
+except ImportError:
+    from collections import OrderedDict
 from fcntl import ioctl
 from fnmatch import fnmatch
 from prettytable import PrettyTable, HEADER
 from signal import signal, SIGWINCH
 from termios import TIOCGWINSZ
+from typing import Optional
 
 from ceph_argparse import parse_json_funcsigs, validate_command
 
@@ -29,7 +33,9 @@ LONG_RUNNING_AVG = 0x4
 READ_CHUNK_SIZE = 4096
 
 
-def admin_socket(asok_path, cmd, format=''):
+def admin_socket(asok_path: str,
+                 cmd: str,
+                 format: Optional[str] = '') -> bytes:
     """
     Send a daemon (--admin-daemon) command 'cmd'.  asok_path is the
     path to the admin socket; cmd is a list of strings; format may be
@@ -188,7 +194,7 @@ class DaemonWatcher(object):
         unit = 0
         while len("%s" % (int(n) // (1000**unit))) > width - 1:
             if unit >= len(units) - 1:
-                break;
+                break
             unit += 1
 
         if unit > 0:
@@ -205,7 +211,7 @@ class DaemonWatcher(object):
             else:
                 color = self.YELLOW, False
             return self.bold(self.colorize(formatted[0:-1], color[0], color[1])) \
-                + self.bold(self.colorize(formatted[-1], self.BLACK, False))
+                + self.bold(self.colorize(formatted[-1], self.YELLOW, False))
         else:
             return formatted
 

@@ -15,65 +15,108 @@
 #pragma once
 
 #include <map>
-#include <optional>
 #include <set>
+#include <vector>
 #include <seastar/core/gate.hh>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/core/shared_future.hh>
 
-#include "msg/Policy.h"
+#include "crimson/net/chained_dispatchers.h"
 #include "Messenger.h"
 #include "SocketConnection.h"
-#include "crimson/thread/Throttle.h"
 
-namespace ceph::net {
+namespace crimson::net {
 
-using SocketPolicy = ceph::net::Policy<ceph::thread::Throttle>;
+class FixedCPUServerSocket;
 
 class SocketMessenger final : public Messenger {
-  std::optional<seastar::server_socket> listener;
-  Dispatcher *dispatcher = nullptr;
+  const seastar::shard_id master_sid;
+  seastar::promise<> shutdown_promise;
+
+  FixedCPUServerSocket* listener = nullptr;
+  ChainedDispatchers dispatchers;
   std::map<entity_addr_t, SocketConnectionRef> connections;
   std::set<SocketConnectionRef> accepting_conns;
-  using Throttle = ceph::thread::Throttle;
+  std::vector<SocketConnectionRef> closing_conns;
   ceph::net::PolicySet<Throttle> policy_set;
-  seastar::gate pending_dispatch;
+  // Distinguish messengers with meaningful names for debugging
+  const std::string logic_name;
+  const uint32_t nonce;
+  // specifying we haven't learned our addr; set false when we find it.
+  bool need_addr = true;
+  uint32_t global_seq = 0;
+  bool started = false;
 
-  seastar::future<> dispatch(SocketConnectionRef conn);
-
-  seastar::future<> accept(seastar::connected_socket socket,
-                           seastar::socket_address paddr);
+  bind_ertr::future<> do_bind(const entity_addrvec_t& addr);
 
  public:
-  SocketMessenger(const entity_name_t& myname);
+  SocketMessenger(const entity_name_t& myname,
+                  const std::string& logic_name,
+                  uint32_t nonce);
+  ~SocketMessenger() override { ceph_assert(!listener); }
 
-  void bind(const entity_addr_t& addr) override;
+  seastar::future<> set_myaddrs(const entity_addrvec_t& addr) override;
 
-  seastar::future<> start(Dispatcher *dispatcher) override;
+  // Messenger interfaces are assumed to be called from its own shard, but its
+  // behavior should be symmetric when called from any shard.
+  bind_ertr::future<> bind(const entity_addrvec_t& addr) override;
+
+  bind_ertr::future<> try_bind(const entity_addrvec_t& addr,
+                               uint32_t min_port, uint32_t max_port) override;
+
+  seastar::future<> start(const dispatchers_t& dispatchers) override;
 
   ConnectionRef connect(const entity_addr_t& peer_addr,
-                        const entity_type_t& peer_type) override;
+                        const entity_name_t& peer_name) override;
+  // can only wait once
+  seastar::future<> wait() override {
+    assert(seastar::this_shard_id() == master_sid);
+    return shutdown_promise.get_future();
+  }
+
+  void stop() override {
+    dispatchers.clear();
+  }
+
+  bool is_started() const override {
+    return !dispatchers.empty();
+  }
 
   seastar::future<> shutdown() override;
 
-  seastar::future<msgr_tag_t, bufferlist>
-  verify_authorizer(peer_type_t peer_type,
-		    auth_proto_t protocol,
-		    bufferlist& auth) override;
+  void print(ostream& out) const override {
+    out << get_myname()
+        << "(" << logic_name
+        << ") " << get_myaddr();
+  }
 
-  seastar::future<std::unique_ptr<AuthAuthorizer>>
-  get_authorizer(peer_type_t peer_type,
-		 bool force_new) override;
+  SocketPolicy get_policy(entity_type_t peer_type) const override;
+
+  SocketPolicy get_default_policy() const override;
+
+  void set_default_policy(const SocketPolicy& p) override;
+
+  void set_policy(entity_type_t peer_type, const SocketPolicy& p) override;
+
+  void set_policy_throttler(entity_type_t peer_type, Throttle* throttle) override;
 
  public:
-  void set_default_policy(const SocketPolicy& p);
-  void set_policy(entity_type_t peer_type, const SocketPolicy& p);
-  void set_policy_throttler(entity_type_t peer_type, Throttle* throttle);
+  seastar::future<uint32_t> get_global_seq(uint32_t old=0);
+  seastar::future<> learned_addr(const entity_addr_t &peer_addr_for_me,
+                                 const SocketConnection& conn);
 
   SocketConnectionRef lookup_conn(const entity_addr_t& addr);
   void accept_conn(SocketConnectionRef);
   void unaccept_conn(SocketConnectionRef);
   void register_conn(SocketConnectionRef);
   void unregister_conn(SocketConnectionRef);
+  void closing_conn(SocketConnectionRef);
+  void closed_conn(SocketConnectionRef);
+  seastar::shard_id shard_id() const {
+    assert(seastar::this_shard_id() == master_sid);
+    return master_sid;
+  }
 };
 
-} // namespace ceph::net
+} // namespace crimson::net

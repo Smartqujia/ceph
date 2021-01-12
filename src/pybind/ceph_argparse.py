@@ -7,11 +7,9 @@ daemon.
 
 Copyright (C) 2013 Inktank Storage, Inc.
 
-LGPL2.1.  See file COPYING.
+LGPL-2.1 or LGPL-3.0.  See file COPYING.
 """
-from __future__ import print_function
 import copy
-import errno
 import math
 import json
 import os
@@ -23,10 +21,18 @@ import sys
 import threading
 import uuid
 
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+
 
 # Flags are from MonCommand.h
-FLAG_MGR = 8   # command is intended for mgr
-FLAG_POLL = 16 # command is intended to be ran continuously by the client
+class Flag:
+    NOFORWARD = (1 << 0)
+    OBSOLETE = (1 << 1)
+    DEPRECATED = (1 << 2)
+    MGR = (1 << 3)
+    POLL = (1 << 4)
+    HIDDEN = (1 << 5)
+
 
 KWARG_EQUALS = "--([^=]+)=(.+)"
 KWARG_SPACE = "--([^=]+)"
@@ -159,15 +165,15 @@ class CephInt(CephArgtype):
 
     def valid(self, s, partial=False):
         try:
-            val = int(s)
+            val = int(s, 0)
         except ValueError:
             raise ArgumentValid("{0} doesn't represent an int".format(s))
         if len(self.range) == 2:
             if val < self.range[0] or val > self.range[1]:
-                raise ArgumentValid("{0} not in range {1}".format(val, self.range))
+                raise ArgumentValid(f"{val} not in range {self.range}")
         elif len(self.range) == 1:
             if val < self.range[0]:
-                raise ArgumentValid("{0} not in range {1}".format(val, self.range))
+                raise ArgumentValid(f"{val} not in range {self.range}")
         self.val = val
 
     def __str__(self):
@@ -199,10 +205,10 @@ class CephFloat(CephArgtype):
             raise ArgumentValid("{0} doesn't represent a float".format(s))
         if len(self.range) == 2:
             if val < self.range[0] or val > self.range[1]:
-                raise ArgumentValid("{0} not in range {1}".format(val, self.range))
+                raise ArgumentValid(f"{val} not in range {self.range}")
         elif len(self.range) == 1:
             if val < self.range[0]:
-                raise ArgumentValid("{0} not in range {1}".format(val, self.range))
+                raise ArgumentValid(f"{val} not in range {self.range}")
         self.val = val
 
     def __str__(self):
@@ -222,7 +228,7 @@ class CephString(CephArgtype):
         from string import printable
         try:
             re.compile(goodchars)
-        except:
+        except re.error:
             raise ValueError('CephString(): "{0}" is not a valid RE'.
                              format(goodchars))
         self.goodchars = goodchars
@@ -287,7 +293,7 @@ class CephIPAddr(CephArgtype):
                 p = None
             try:
                 socket.inet_pton(socket.AF_INET, a)
-            except:
+            except OSError:
                 raise ArgumentValid('{0}: invalid IPv4 address'.format(a))
         else:
             # v6
@@ -298,7 +304,7 @@ class CephIPAddr(CephArgtype):
                 if s[end + 1] == ':':
                     try:
                         p = int(s[end + 2])
-                    except:
+                    except ValueError:
                         raise ArgumentValid('{0}: bad port number'.format(s))
                 a = s[1:end]
             else:
@@ -306,7 +312,7 @@ class CephIPAddr(CephArgtype):
                 p = None
             try:
                 socket.inet_pton(socket.AF_INET6, a)
-            except:
+            except OSError:
                 raise ArgumentValid('{0} not valid IPv6 address'.format(s))
         if p is not None and int(p) > 65535:
             raise ArgumentValid("{0} not a valid port number".format(p))
@@ -421,7 +427,7 @@ class CephName(CephArgtype):
                 if i != '*':
                     try:
                         i = int(i)
-                    except:
+                    except ValueError:
                         raise ArgumentFormat('osd id ' + i + ' not integer')
             self.nametype = t
         self.val = s
@@ -454,7 +460,7 @@ class CephOsdName(CephArgtype):
             i = s
         try:
             i = int(i)
-        except:
+        except ValueError:
             raise ArgumentFormat('osd id ' + i + ' not integer')
         if i < 0:
             raise ArgumentFormat('osd id {0} is less than 0'.format(i))
@@ -560,11 +566,11 @@ class CephFragment(CephArgtype):
             raise ArgumentFormat("{0} not a hex integer".format(val))
         try:
             int(val)
-        except:
+        except ValueError:
             raise ArgumentFormat('can\'t convert {0} to integer'.format(val))
         try:
             int(bits)
-        except:
+        except ValueError:
             raise ArgumentFormat('can\'t convert {0} to integer'.format(bits))
         self.val = s
 
@@ -690,9 +696,9 @@ class argdesc(object):
         else:
             s = '{0}({1})'.format(self.name, str(self.instance))
             if self.N:
-                s += ' [' + str(self.instance) + '...]'
+                s += '...'
         if not self.req:
-            s = '{' + s + '}'
+            s = '[' + s + ']'
         return s
 
     def helpstr(self):
@@ -700,17 +706,29 @@ class argdesc(object):
         like str(), but omit parameter names (except for CephString,
         which really needs them)
         """
-        if self.t == CephString:
-            chunk = '<{0}>'.format(self.name)
-        elif self.t == CephBool:
+        if self.t == CephBool:
             chunk = "--{0}".format(self.name.replace("_", "-"))
-        else:
+        elif self.t == CephPrefix or self.t == CephChoices:
             chunk = str(self.instance)
+        elif self.t == CephOsdName:
+            # it just so happens all CephOsdName commands are named 'id' anyway,
+            # so <id|osd.id> is perfect.
+            chunk = '<id|osd.id>'
+        elif self.t == CephName:
+            # CephName commands similarly only have one arg of the
+            # type, so <type.id> is good.
+            chunk = '<type.id>'
+        elif self.t == CephInt:
+            chunk = '<{0}:int>'.format(self.name)
+        elif self.t == CephFloat:
+            chunk = '<{0}:float>'.format(self.name)
+        else:
+            chunk = '<{0}>'.format(self.name)
         s = chunk
         if self.N:
-            s += ' [' + chunk + '...]'
+            s += '...'
         if not self.req:
-            s = '{' + s + '}'
+            s = '[' + s + ']'
         return s
 
     def complete(self, s):
@@ -739,7 +757,7 @@ def descsort(sh1, sh2):
     return cmp(descsort_key(sh1), descsort_key(sh2))
 
 
-def parse_funcsig(sig):
+def parse_funcsig(sig: Sequence[Union[str, Dict[str, str]]]) -> List[argdesc]:
     """
     parse a single descriptor (array of strings or dicts) into a
     dict of function descriptor/validators (objects of CephXXX type)
@@ -782,7 +800,8 @@ def parse_funcsig(sig):
     return newsig
 
 
-def parse_json_funcsigs(s, consumer):
+def parse_json_funcsigs(s: str,
+                        consumer: str) -> Dict[str, Dict[str, List[argdesc]]]:
     """
     A function signature is mostly an array of argdesc; it's represented
     in JSON as
@@ -891,7 +910,12 @@ def matchnum(args, signature, partial=False):
     return matchcnt
 
 
-def store_arg(desc, d):
+ValidatedArgs = Dict[str, Union[bool, int, float, str,
+                                Tuple[str, str],
+                                Sequence[str]]]
+
+
+def store_arg(desc: argdesc, d: ValidatedArgs):
     '''
     Store argument described by, and held in, thanks to valid(),
     desc into the dictionary d, keyed by desc.name.  Three cases:
@@ -916,7 +940,10 @@ def store_arg(desc, d):
         d[desc.name] = desc.instance.val
 
 
-def validate(args, signature, flags=0, partial=False):
+def validate(args: List[str],
+             signature: Sequence[argdesc],
+             flags: Optional[int] = 0,
+             partial: Optional[bool] = False) -> ValidatedArgs:
     """
     validate(args, signature, flags=0, partial=False)
 
@@ -1006,6 +1033,7 @@ def validate(args, signature, flags=0, partial=False):
 
                 if kwarg_desc:
                     validate_one(kwarg_v, kwarg_desc)
+                    matchcnt += 1
                     store_arg(kwarg_desc, d)
                     continue
 
@@ -1060,15 +1088,12 @@ def validate(args, signature, flags=0, partial=False):
             # Have an arg; validate it
             try:
                 validate_one(myarg, desc)
-                valid = True
             except ArgumentError as e:
-                valid = False
-
                 # argument mismatch
                 if not desc.req:
                     # if not required, just push back; it might match
                     # the next arg
-                    save_exception = [ myarg, e ]
+                    save_exception = [myarg, e]
                     myargs.insert(0, myarg)
                     break
                 else:
@@ -1092,22 +1117,24 @@ def validate(args, signature, flags=0, partial=False):
             print(save_exception[0], 'not valid: ', save_exception[1], file=sys.stderr)
         raise ArgumentError("unused arguments: " + str(myargs))
 
-    if flags & FLAG_MGR:
-        d['target'] = ('mgr','')
+    if flags & Flag.MGR:
+        d['target'] = ('mon-mgr', '')
 
-    if flags & FLAG_POLL:
+    if flags & Flag.POLL:
         d['poll'] = True
 
     # Finally, success
     return d
 
 
-def validate_command(sigdict, args, verbose=False):
+def validate_command(sigdict: Dict[str, Dict[str, Any]],
+                     args: Sequence[str],
+                     verbose: Optional[bool] = False) -> ValidatedArgs:
     """
     Parse positional arguments into a parameter dict, according to
     the command descriptions.
 
-    Writes advice about nearly-matching commands ``sys.stderr`` if 
+    Writes advice about nearly-matching commands ``sys.stderr`` if
     the arguments do not match any command.
 
     :param sigdict: A command description dictionary, as returned
@@ -1129,6 +1156,9 @@ def validate_command(sigdict, args, verbose=False):
     best_match_cnt = 0
     bestcmds = []
     for cmd in sigdict.values():
+        flags = cmd.get('flags', 0)
+        if flags & Flag.OBSOLETE:
+            continue
         sig = cmd['sig']
         matched = matchnum(args, sig, partial=True)
         if (matched >= math.floor(best_match_cnt) and
@@ -1138,7 +1168,7 @@ def validate_command(sigdict, args, verbose=False):
         if matched < best_match_cnt:
             continue
         if verbose:
-            print("better match: {0} > {1}: {3} ".format(
+            print("better match: {0} > {1}: {2} ".format(
                 matched, best_match_cnt, concise_sig(sig)
             ), file=sys.stderr)
         if matched > best_match_cnt:
@@ -1147,10 +1177,15 @@ def validate_command(sigdict, args, verbose=False):
         else:
             bestcmds.append(cmd)
 
-    # Sort bestcmds by number of args so we can try shortest first
+    # Sort bestcmds by number of req args so we can try shortest first
     # (relies on a cmdsig being key,val where val is a list of len 1)
-    bestcmds_sorted = sorted(bestcmds, key=lambda c: len(c['sig']))
 
+    def grade(cmd):
+        # prefer optional arguments over required ones
+        sigs = cmd['sig']
+        return sum(map(lambda sig: sig.req, sigs))
+
+    bestcmds_sorted = sorted(bestcmds, key=grade)
     if verbose:
         print("bestcmds_sorted: ", file=sys.stderr)
         pprint.PrettyPrinter(stream=sys.stderr).pprint(bestcmds_sorted)
@@ -1193,15 +1228,17 @@ def validate_command(sigdict, args, verbose=False):
             print("Invalid command:", ex, file=sys.stderr)
             print(concise_sig(sig), ': ', cmd['help'], file=sys.stderr)
     else:
-        bestcmds = bestcmds[:10]
-        print('no valid command found; {0} closest matches:'.format(len(bestcmds)), file=sys.stderr)
+        bestcmds = [c for c in bestcmds
+                    if not c.get('flags', 0) & (Flag.DEPRECATED | Flag.HIDDEN)]
+        bestcmds = bestcmds[:10]  # top 10
+        print('no valid command found; {0} closest matches:'.format(len(bestcmds)),
+              file=sys.stderr)
         for cmd in bestcmds:
             print(concise_sig(cmd['sig']), file=sys.stderr)
     return valid_dict
 
 
-
-def find_cmd_target(childargs):
+def find_cmd_target(childargs: List[str]) -> Tuple[str, str]:
     """
     Using a minimal validation, figure out whether the command
     should be sent to a monitor or an osd.  We do this before even
@@ -1284,14 +1321,17 @@ class RadosThread(threading.Thread):
             self.exception = e
 
 
-# time in seconds between each call to t.join() for child thread
-POLL_TIME_INCR = 0.5
-
-
-def run_in_thread(func, *args, **kwargs):
-    interrupt = False
+def run_in_thread(func: Callable[[Any, Any], int],
+                  *args: Any, **kwargs: Any) -> int:
     timeout = kwargs.pop('timeout', 0)
-    countdown = timeout
+    if timeout == 0 or timeout is None:
+        # python threading module will just get blocked if timeout is `None`,
+        # otherwise it will keep polling until timeout or thread stops.
+        # timeout in integer when converting it to nanoseconds, but since
+        # python3 uses `int64_t` for the deadline before timeout expires,
+        # we have to use a safe value which does not overflow after being
+        # added to current time in microseconds.
+        timeout = 24 * 60 * 60
     t = RadosThread(func, *args, **kwargs)
 
     # allow the main thread to exit (presumably, avoid a join() on this
@@ -1300,33 +1340,22 @@ def run_in_thread(func, *args, **kwargs):
     t.daemon = True
 
     t.start()
-    try:
-        # poll for thread exit
-        while t.is_alive():
-            t.join(POLL_TIME_INCR)
-            if timeout and t.is_alive():
-                countdown = countdown - POLL_TIME_INCR
-                if countdown <= 0:
-                    raise KeyboardInterrupt
-
-        t.join()        # in case t exits before reaching the join() above
-    except KeyboardInterrupt:
-        # ..but allow SIGINT to terminate the waiting.  Note: this
-        # relies on the Linux kernel behavior of delivering the signal
-        # to the main thread in preference to any subthread (all that's
-        # strictly guaranteed is that *some* thread that has the signal
-        # unblocked will receive it).  But there doesn't seem to be
-        # any interface to create t with SIGINT blocked.
-        interrupt = True
-
-    if interrupt:
-        t.retval = -errno.EINTR, None, 'Interrupted!'
-    if t.exception:
+    t.join(timeout=timeout)
+    # ..but allow SIGINT to terminate the waiting.  Note: this
+    # relies on the Linux kernel behavior of delivering the signal
+    # to the main thread in preference to any subthread (all that's
+    # strictly guaranteed is that *some* thread that has the signal
+    # unblocked will receive it).  But there doesn't seem to be
+    # any interface to create a thread with SIGINT blocked.
+    if t.is_alive():
+        raise Exception("timed out")
+    elif t.exception:
         raise t.exception
-    return t.retval
+    else:
+        return t.retval
 
 
-def send_command_retry(*args, **kwargs):
+def send_command_retry(*args: Any, **kwargs: Any) -> Tuple[int, bytes, str]:
     while True:
         try:
             return send_command(*args, **kwargs)
@@ -1339,8 +1368,13 @@ def send_command_retry(*args, **kwargs):
             else:
                 raise
 
-def send_command(cluster, target=('mon', ''), cmd=None, inbuf=b'', timeout=0,
-                 verbose=False):
+
+def send_command(cluster,
+                 target: Optional[Tuple[str, str]] = ('mon', ''),
+                 cmd: Optional[List[str]] = None,
+                 inbuf: Optional[bytes] = b'',
+                 timeout: Optional[int] = 0,
+                 verbose: Optional[bool] = False) -> Tuple[int, bytes, str]:
     """
     Send a command to a daemon using librados's
     mon_command, osd_command, mgr_command, or pg_command.  Any bulk input data
@@ -1364,6 +1398,19 @@ def send_command(cluster, target=('mon', ''), cmd=None, inbuf=b'', timeout=0,
                 cluster.osd_command, osdid, cmd, inbuf, timeout=timeout)
 
         elif target[0] == 'mgr':
+            name = ''     # non-None empty string means "current active mgr"
+            if len(target) > 1 and target[1] is not None:
+                name = target[1]
+            if verbose:
+                print('submit {0} to {1} name {2}'.format(cmd, target[0], name),
+                      file=sys.stderr)
+            ret, outbuf, outs = run_in_thread(
+                cluster.mgr_command, cmd, inbuf, timeout=timeout, target=name)
+
+        elif target[0] == 'mon-mgr':
+            if verbose:
+                print('submit {0} to {1}'.format(cmd, target[0]),
+                      file=sys.stderr)
             ret, outbuf, outs = run_in_thread(
                 cluster.mgr_command, cmd, inbuf, timeout=timeout)
 
@@ -1372,11 +1419,11 @@ def send_command(cluster, target=('mon', ''), cmd=None, inbuf=b'', timeout=0,
             # pgid will already be in the command for the pg <pgid>
             # form, but for tell <pgid>, we need to put it in
             if cmd:
-                cmddict = json.loads(cmd[0])
+                cmddict = json.loads(cmd)
                 cmddict['pgid'] = pgid
             else:
                 cmddict = dict(pgid=pgid)
-            cmd = [json.dumps(cmddict)]
+            cmd = json.dumps(cmddict)
             if verbose:
                 print('submit {0} for pgid {1}'.format(cmd, pgid),
                       file=sys.stderr)
@@ -1422,8 +1469,13 @@ def send_command(cluster, target=('mon', ''), cmd=None, inbuf=b'', timeout=0,
     return ret, outbuf, outs
 
 
-def json_command(cluster, target=('mon', ''), prefix=None, argdict=None,
-                 inbuf=b'', timeout=0, verbose=False):
+def json_command(cluster,
+                 target: Optional[Tuple[str, str]] = ('mon', ''),
+                 prefix: Optional[str] = None,
+                 argdict: Optional[Dict[str, str]] = None,
+                 inbuf: Optional[bytes] = b'',
+                 timeout: Optional[int] = 0,
+                 verbose: Optional[bool] = False) -> Tuple[int, bytes, str]:
     """
     Serialize a command and up a JSON command and send it with send_command() above.
     Prefix may be supplied separately or in argdict.  Any bulk input
@@ -1458,7 +1510,7 @@ def json_command(cluster, target=('mon', ''), prefix=None, argdict=None,
                 # use the target we were originally given
                 pass
         ret, outbuf, outs = send_command_retry(cluster,
-                                               target, [json.dumps(cmddict)],
+                                               target, json.dumps(cmddict),
                                                inbuf, timeout, verbose)
 
     except Exception as e:

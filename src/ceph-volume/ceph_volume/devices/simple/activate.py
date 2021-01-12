@@ -1,6 +1,7 @@
 from __future__ import print_function
 import argparse
 import base64
+import glob
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ from textwrap import dedent
 from ceph_volume import process, decorators, terminal, conf
 from ceph_volume.util import system, disk
 from ceph_volume.util import encryption as encryption_utils
+from ceph_volume.util import prepare as prepare_utils
 from ceph_volume.systemd import systemctl
 
 
@@ -34,8 +36,16 @@ class Activate(object):
         try:
             objectstore = json_config['type']
         except KeyError:
-            logger.warning('"type" was not defined, will assume "bluestore"')
-            objectstore = 'bluestore'
+            if {'data', 'journal'}.issubset(set(devices)):
+                logger.warning(
+                    '"type" key not found, assuming "filestore" since journal key is present'
+                )
+                objectstore = 'filestore'
+            else:
+                logger.warning(
+                    '"type" key not found, assuming "bluestore" since journal key is not present'
+                )
+                objectstore = 'bluestore'
 
         # Go through all the device combinations that are absolutely required,
         # raise an error describing what was expected and what was found
@@ -160,13 +170,22 @@ class Activate(object):
 
         # XXX there is no support for LVM here
         data_device = self.get_device(data_uuid)
+
+        if not data_device:
+            raise RuntimeError("osd fsid {} doesn't exist, this file will "
+                "be skipped, consider cleaning legacy "
+                "json file {}".format(osd_metadata['fsid'], args.json_config))
+
         journal_device = self.get_device(osd_metadata.get('journal', {}).get('uuid'))
         block_device = self.get_device(osd_metadata.get('block', {}).get('uuid'))
         block_db_device = self.get_device(osd_metadata.get('block.db', {}).get('uuid'))
         block_wal_device = self.get_device(osd_metadata.get('block.wal', {}).get('uuid'))
 
         if not system.device_is_mounted(data_device, destination=osd_dir):
-            process.run(['mount', '-v', data_device, osd_dir])
+            if osd_metadata.get('type') == 'filestore':
+                prepare_utils.mount_osd(data_device, osd_id)
+            else:
+                process.run(['mount', '-v', data_device, osd_dir])
 
         device_map = {
             'journal': journal_device,
@@ -231,6 +250,12 @@ class Activate(object):
             help='The FSID of the OSD, similar to a SHA1'
         )
         parser.add_argument(
+            '--all',
+            help='Activate all OSDs with a OSD JSON config',
+            action='store_true',
+            default=False,
+        )
+        parser.add_argument(
             '--file',
             help='The path to a JSON file, from a scanned OSD'
         )
@@ -244,7 +269,7 @@ class Activate(object):
             print(sub_command_help)
             return
         args = parser.parse_args(self.argv)
-        if not args.file:
+        if not args.file and not args.all:
             if not args.osd_id and not args.osd_fsid:
                 terminal.error('ID and FSID are required to find the right OSD to activate')
                 terminal.error('from a scanned OSD location in /etc/ceph/osd/')
@@ -253,13 +278,25 @@ class Activate(object):
         # implicitly indicate that it would be possible to activate a json file
         # at a non-default location which would not work at boot time if the
         # custom location is not exposed through an ENV var
-        json_dir = os.environ.get('CEPH_VOLUME_SIMPLE_JSON_DIR', '/etc/ceph/osd/')
-        if args.file:
-            json_config = args.file
-        else:
-            json_config = os.path.join(json_dir, '%s-%s.json' % (args.osd_id, args.osd_fsid))
-        if not os.path.exists(json_config):
-            raise RuntimeError('Expected JSON config path not found: %s' % json_config)
-        args.json_config = json_config
         self.skip_systemd = args.skip_systemd
-        self.activate(args)
+        json_dir = os.environ.get('CEPH_VOLUME_SIMPLE_JSON_DIR', '/etc/ceph/osd/')
+        if args.all:
+            if args.file or args.osd_id:
+                mlogger.warn('--all was passed, ignoring --file and ID/FSID arguments')
+            json_configs = glob.glob('{}/*.json'.format(json_dir))
+            for json_config in json_configs:
+                mlogger.info('activating OSD specified in {}'.format(json_config))
+                args.json_config = json_config
+                try:
+                    self.activate(args)
+                except RuntimeError as e:
+                    terminal.warning(e.message)
+        else:
+            if args.file:
+                json_config = args.file
+            else:
+                json_config = os.path.join(json_dir, '%s-%s.json' % (args.osd_id, args.osd_fsid))
+            if not os.path.exists(json_config):
+                raise RuntimeError('Expected JSON config path not found: %s' % json_config)
+            args.json_config = json_config
+            self.activate(args)

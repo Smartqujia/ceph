@@ -1,12 +1,13 @@
 import { Component, EventEmitter, Output } from '@angular/core';
 import { AbstractControl, ValidationErrors, ValidatorFn, Validators } from '@angular/forms';
 
-import * as _ from 'lodash';
-import { BsModalRef } from 'ngx-bootstrap/modal';
+import { NgbActiveModal } from '@ng-bootstrap/ng-bootstrap';
+import _ from 'lodash';
 
-import { CdFormBuilder } from '../../../shared/forms/cd-form-builder';
-import { CdFormGroup } from '../../../shared/forms/cd-form-group';
-import { CdValidators, isEmptyInputValue } from '../../../shared/forms/cd-validators';
+import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
+import { CdFormBuilder } from '~/app/shared/forms/cd-form-builder';
+import { CdFormGroup } from '~/app/shared/forms/cd-form-group';
+import { CdValidators, isEmptyInputValue } from '~/app/shared/forms/cd-validators';
 import { RgwUserSubuser } from '../models/rgw-user-subuser';
 
 @Component({
@@ -25,10 +26,16 @@ export class RgwUserSubuserModalComponent {
   formGroup: CdFormGroup;
   editing = true;
   subusers: RgwUserSubuser[] = [];
+  resource: string;
+  action: string;
 
-  constructor(private formBuilder: CdFormBuilder, public bsModalRef: BsModalRef) {
+  constructor(
+    private formBuilder: CdFormBuilder,
+    public bsModalRef: NgbActiveModal,
+    private actionLabels: ActionLabelsI18n
+  ) {
+    this.resource = $localize`Subuser`;
     this.createForm();
-    this.listenToChanges();
   }
 
   createForm() {
@@ -39,17 +46,6 @@ export class RgwUserSubuserModalComponent {
       // Swift key
       generate_secret: [true],
       secret_key: [null, [CdValidators.requiredIf({ generate_secret: false })]]
-    });
-  }
-
-  listenToChanges() {
-    // Reset the validation status of various controls, especially those that are using
-    // the 'requiredIf' validator. This is necessary because the controls itself are not
-    // validated again if the status of their prerequisites have been changed.
-    this.formGroup.get('generate_secret').valueChanges.subscribe(() => {
-      ['secret_key'].forEach((path) => {
-        this.formGroup.get(path).updateValueAndValidity({ onlySelf: true });
-      });
     });
   }
 
@@ -96,6 +92,7 @@ export class RgwUserSubuserModalComponent {
    */
   setEditing(editing: boolean = true) {
     this.editing = editing;
+    this.action = this.editing ? this.actionLabels.EDIT : this.actionLabels.CREATE;
   }
 
   /**
@@ -128,6 +125,6 @@ export class RgwUserSubuserModalComponent {
     subuser.generate_secret = values.generate_secret;
     subuser.secret_key = values.secret_key;
     this.submitAction.emit(subuser);
-    this.bsModalRef.hide();
+    this.bsModalRef.close();
   }
 }

@@ -1,12 +1,13 @@
-import { SelectBadgesOption } from '../../../shared/components/select-badges/select-badges-option.model';
+import { SelectOption } from '~/app/shared/components/select/select-option.model';
 
-export class UserFormRoleModel implements SelectBadgesOption {
+export class UserFormRoleModel implements SelectOption {
   name: string;
   description: string;
   selected = false;
   scopes_permissions: object;
+  enabled = true;
 
-  constructor(name, description) {
+  constructor(name: string, description: string) {
     this.name = name;
     this.description = description;
   }

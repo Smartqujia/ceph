@@ -1,30 +1,23 @@
-=============
-Ceph Releases
-=============
+.. _ceph-releases-index:
 
-.. _ceph-releases:
-
-Release Index
--------------
+=====================
+Ceph Releases (index)
+=====================
 
 .. toctree::
    :maxdepth: 1
-
-   Release Schedule <schedule>
-
 
 Active Releases
-~~~~~~~~~~~~~~~
+---------------
 
 .. toctree::
    :maxdepth: 1
 
-   Mimic <mimic>
-   Luminous <luminous>
-   Jewel <jewel>
+   Octopus <octopus>
+   Nautilus <nautilus>
 
 Archived Releases
-~~~~~~~~~~~~~~~~~
+-----------------
 
 .. toctree::
    :maxdepth: 1 

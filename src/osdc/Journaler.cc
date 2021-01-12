@@ -417,6 +417,13 @@ void Journaler::_finish_reread_head_and_probe(int r, C_OnFinisher *onfinish)
     return;
   }
 
+  // Let the caller know that the operation has failed or was intentionally
+  // failed since the caller has been blocklisted.
+  if (r == -EBLOCKLISTED) {
+    onfinish->complete(r);
+    return;
+  }
+
   ceph_assert(!r); //if we get an error, we're boned
   _reprobe(onfinish);
 }
@@ -697,7 +704,8 @@ void Journaler::wait_for_flush(Context *onsafe)
 {
   lock_guard l(lock);
   if (is_stopping()) {
-    onsafe->complete(-EAGAIN);
+    if (onsafe)
+      onsafe->complete(-EAGAIN);
     return;
   }
   _wait_for_flush(onsafe);
@@ -730,7 +738,8 @@ void Journaler::flush(Context *onsafe)
 {
   lock_guard l(lock);
   if (is_stopping()) {
-    onsafe->complete(-EAGAIN);
+    if (onsafe)
+      onsafe->complete(-EAGAIN);
     return;
   }
   _flush(wrap_finisher(onsafe));
@@ -1263,6 +1272,13 @@ bool Journaler::try_read_entry(bufferlist& bl)
 
   // prefetch?
   _prefetch();
+
+  // If bufferlist consists of discontiguous memory, decoding types whose
+  // denc_traits needs contiguous memory is inefficient. The bufferlist may
+  // get copied to temporary memory multiple times (copy_shallow() in
+  // src/include/denc.h actually does deep copy)
+  if (bl.get_num_buffers() > 1)
+    bl.rebuild();
   return true;
 }
 

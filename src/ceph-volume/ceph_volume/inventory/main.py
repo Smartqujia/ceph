@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
-import pprint
+import json
 
 from ceph_volume.util.device import Devices, Device
 
@@ -31,16 +31,37 @@ class Inventory(object):
             default='plain',
             help='Output format',
         )
+        parser.add_argument(
+            '--filter-for-batch',
+            action='store_true',
+            help=('Filter devices unsuitable to pass to an OSD service spec, '
+                  'no effect when <path> is passed'),
+            default=False,
+        )
+        parser.add_argument(
+            '--with-lsm',
+            action='store_true',
+            help=('Attempt to retrieve additional health and metadata through '
+                  'libstoragemgmt'),
+            default=False,
+        )
         self.args = parser.parse_args(self.argv)
         if self.args.path:
-            self.format_report(Device(self.args.path))
+            self.format_report(Device(self.args.path, with_lsm=self.args.with_lsm))
         else:
-            self.format_report(Devices())
+            self.format_report(Devices(filter_for_batch=self.args.filter_for_batch,
+                                       with_lsm=self.args.with_lsm))
+
+    def get_report(self):
+        if self.args.path:
+            return Device(self.args.path, with_lsm=self.args.with_lsm).json_report()
+        else:
+            return Devices(filter_for_batch=self.args.filter_for_batch, with_lsm=self.args.with_lsm).json_report()
 
     def format_report(self, inventory):
         if self.args.format == 'json':
-            print(inventory.json_report())
+            print(json.dumps(inventory.json_report()))
         elif self.args.format == 'json-pretty':
-            pprint.pprint(inventory.json_report())
+            print(json.dumps(inventory.json_report(), indent=4, sort_keys=True))
         else:
             print(inventory.pretty_report())

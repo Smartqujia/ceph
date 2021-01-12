@@ -13,12 +13,15 @@ from . import context
 def auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
+        if not context.instance.enable_auth:
+            return f(*args, **kwargs)
+            
         if not request.authorization:
             response.status = 401
             response.headers['WWW-Authenticate'] = 'Basic realm="Login Required"'
             return {'message': 'auth: No HTTP username/password'}
 
-        username, password = b64decode(request.authorization[1]).split(':')
+        username, password = b64decode(request.authorization[1]).decode('utf-8').split(':')
 
         # Check that the username exists
         if username not in context.instance.keys:

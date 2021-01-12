@@ -1,17 +1,13 @@
-
 """
 Test our tools for recovering metadata from the data pool into an alternate pool
 """
-import json
 
 import logging
-import os
-from textwrap import dedent
 import traceback
-from collections import namedtuple, defaultdict
+from collections import namedtuple
 
 from teuthology.orchestra.run import CommandFailedError
-from tasks.cephfs.cephfs_test_case import CephFSTestCase, for_teuthology
+from tasks.cephfs.cephfs_test_case import CephFSTestCase
 
 log = logging.getLogger(__name__)
 
@@ -186,14 +182,12 @@ class TestRecoveryPool(CephFSTestCase):
         for rank in self.recovery_fs.get_ranks(status=status):
             self.fs.mon_manager.raw_cluster_cmd('tell', "mds." + rank['name'],
                                                 'injectargs', '--debug-mds=20')
-            self.fs.rank_asok(['scrub_path', '/', 'recursive', 'repair'], rank=rank['rank'], status=status)
+            self.fs.rank_tell(['scrub', 'start', '/', 'recursive', 'repair'], rank=rank['rank'], status=status)
         log.info(str(self.mds_cluster.status()))
 
         # Mount a client
-        self.mount_a.mount()
-        self.mount_b.mount(mount_fs_name=recovery_fs)
-        self.mount_a.wait_until_mounted()
-        self.mount_b.wait_until_mounted()
+        self.mount_a.mount_wait()
+        self.mount_b.mount_wait(cephfs_name=recovery_fs)
 
         # See that the files are present and correct
         errors = workload.validate()

@@ -12,7 +12,7 @@ public:
 
   int handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) override
   {
-    auto bl_buffers = bl.buffers();
+    auto& bl_buffers = bl.buffers();
     auto i = bl_buffers.begin();
     while (bl_len > 0)
     {
@@ -129,6 +129,7 @@ TEST(Compress, LimitedChunkSize)
     RGWCompressionInfo cs_info;
     cs_info.compression_type = plugin->get_type_name();
     cs_info.orig_size = s;
+    cs_info.compressor_message = compressor.get_compressor_message();
     cs_info.blocks = move(compressor.get_compression_blocks());
 
     ut_get_sink_size d_sink;
@@ -167,6 +168,7 @@ TEST(Compress, BillionZeros)
   RGWCompressionInfo cs_info;
   cs_info.compression_type = plugin->get_type_name();
   cs_info.orig_size = size*1000;
+  cs_info.compressor_message = compressor.get_compressor_message();
   cs_info.blocks = move(compressor.get_compression_blocks());
 
   ut_get_sink d_sink;

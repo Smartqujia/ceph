@@ -3,7 +3,7 @@ import { TestBed } from '@angular/core/testing';
 
 import { of as observableOf } from 'rxjs';
 
-import { configureTestBed } from '../../../testing/unit-test-helper';
+import { configureTestBed } from '~/testing/unit-test-helper';
 import { RgwUserService } from './rgw-user.service';
 
 describe('RgwUserService', () => {
@@ -16,8 +16,8 @@ describe('RgwUserService', () => {
   });
 
   beforeEach(() => {
-    service = TestBed.get(RgwUserService);
-    httpTesting = TestBed.get(HttpTestingController);
+    service = TestBed.inject(RgwUserService);
+    httpTesting = TestBed.inject(HttpTestingController);
   });
 
   afterEach(() => {

@@ -5,6 +5,7 @@
 #include "include/rbd_types.h"
 #include "include/rados/librados.hpp"
 #include "common/errno.h"
+#include "common/Cond.h"
 #include "librbd/Utils.h"
 #include "librbd/watcher/Utils.h"
 
@@ -27,7 +28,7 @@ static const uint64_t NOTIFY_TIMEOUT_MS = 5000;
 
 template <typename I>
 MirroringWatcher<I>::MirroringWatcher(librados::IoCtx &io_ctx,
-                                      ContextWQ *work_queue)
+                                      asio::ContextWQ *work_queue)
   : Watcher(io_ctx, work_queue, RBD_MIRRORING) {
 }
 

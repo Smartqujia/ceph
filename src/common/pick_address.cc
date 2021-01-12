@@ -13,22 +13,37 @@
  */
 
 #include "common/pick_address.h"
-#include "include/ipaddr.h"
-#include "include/str_list.h"
-#include "common/config_obs.h"
-#include "common/debug.h"
-#include "common/errno.h"
 
 #include <netdb.h>
+#include <string>
+#include <string.h>
+#include <vector>
+
+#include <fmt/format.h>
+
+#include "include/ipaddr.h"
+#include "include/str_list.h"
+#include "common/ceph_context.h"
+#ifndef WITH_SEASTAR
+#include "common/config.h"
+#include "common/config_obs.h"
+#endif
+#include "common/debug.h"
+#include "common/errno.h"
+#include "common/numa.h"
 
 #define dout_subsys ceph_subsys_
+
+using std::string;
+using std::vector;
 
 const struct sockaddr *find_ip_in_subnet_list(
   CephContext *cct,
   const struct ifaddrs *ifa,
   unsigned ipv,
   const std::string &networks,
-  const std::string &interfaces)
+  const std::string &interfaces,
+  int numa_node)
 {
   std::list<string> nets;
   get_str_list(networks, nets);
@@ -94,7 +109,7 @@ const struct sockaddr *find_ip_in_subnet_list(
 
     const struct ifaddrs *found = find_ip_in_subnet(
       filtered,
-      (struct sockaddr *) &net, prefix_len);
+      (struct sockaddr *) &net, prefix_len, numa_node);
     if (found) {
       r = found->ifa_addr;
       break;
@@ -112,6 +127,7 @@ const struct sockaddr *find_ip_in_subnet_list(
   return r;
 }
 
+#ifndef WITH_SEASTAR
 // observe this change
 struct Observer : public md_config_obs_t {
   const char *keys[2];
@@ -133,14 +149,16 @@ static void fill_in_one_address(CephContext *cct,
 				const struct ifaddrs *ifa,
 				const string networks,
 				const string interfaces,
-				const char *conf_var)
+				const char *conf_var,
+				int numa_node = -1)
 {
   const struct sockaddr *found = find_ip_in_subnet_list(
     cct,
     ifa,
     CEPH_PICK_ADDRESS_IPV4|CEPH_PICK_ADDRESS_IPV6,
     networks,
-    interfaces);
+    interfaces,
+    numa_node);
   if (!found) {
     lderr(cct) << "unable to find any IP address in networks '" << networks
 	       << "' interfaces '" << interfaces << "'" << dendl;
@@ -214,6 +232,7 @@ void pick_addresses(CephContext *cct, int needs)
 
   freeifaddrs(ifa);
 }
+#endif	// !WITH_SEASTAR
 
 static int fill_in_one_address(
   CephContext *cct,
@@ -221,13 +240,22 @@ static int fill_in_one_address(
   unsigned ipv,
   const string networks,
   const string interfaces,
-  entity_addrvec_t *addrs)
+  entity_addrvec_t *addrs,
+  int numa_node = -1)
 {
   const struct sockaddr *found = find_ip_in_subnet_list(cct, ifa, ipv, networks,
-							interfaces);
+							interfaces, numa_node);
   if (!found) {
-    lderr(cct) << "unable to find any IP address in networks '" << networks
-	       << "' interfaces '" << interfaces << "'" << dendl;
+    std::string ip_type = "";
+    if ((ipv & CEPH_PICK_ADDRESS_IPV4) && (ipv & CEPH_PICK_ADDRESS_IPV6)) {
+      ip_type = "IPv4 or IPv6";
+    } else if (ipv & CEPH_PICK_ADDRESS_IPV4) {
+      ip_type = "IPv4";
+    } else {
+      ip_type = "IPv6";
+    }
+    lderr(cct) << "unable to find any " << ip_type << " address in networks '"
+               << networks << "' interfaces '" << interfaces << "'" << dendl;
     return -1;
   }
 
@@ -261,7 +289,8 @@ int pick_addresses(
   CephContext *cct,
   unsigned flags,
   struct ifaddrs *ifa,
-  entity_addrvec_t *addrs)
+  entity_addrvec_t *addrs,
+  int preferred_numa_node)
 {
   addrs->v.clear();
 
@@ -327,29 +356,35 @@ int pick_addresses(
   }
   if (addr.is_blank_ip() &&
       !networks.empty()) {
-    // note: pass in ipv to filter the matching addresses
-    if ((ipv & CEPH_PICK_ADDRESS_IPV4) &&
-	(flags & CEPH_PICK_ADDRESS_PREFER_IPV4)) {
-      int r = fill_in_one_address(cct, ifa, CEPH_PICK_ADDRESS_IPV4, networks, interfaces,
-				  addrs);
-      if (r < 0) {
-	return r;
+    int ipv4_r = !(ipv & CEPH_PICK_ADDRESS_IPV4) ? 0 : -1;
+    int ipv6_r = !(ipv & CEPH_PICK_ADDRESS_IPV6) ? 0 : -1;
+    // first try on preferred numa node (if >= 0), then anywhere.
+    while (true) {
+      // note: pass in ipv to filter the matching addresses
+      if ((ipv & CEPH_PICK_ADDRESS_IPV4) &&
+	  (flags & CEPH_PICK_ADDRESS_PREFER_IPV4)) {
+	ipv4_r = fill_in_one_address(cct, ifa, CEPH_PICK_ADDRESS_IPV4,
+                                     networks, interfaces, addrs,
+                                     preferred_numa_node);
       }
-    }
-    if (ipv & CEPH_PICK_ADDRESS_IPV6) {
-      int r = fill_in_one_address(cct, ifa, CEPH_PICK_ADDRESS_IPV6, networks, interfaces,
-				  addrs);
-      if (r < 0) {
-	return r;
+      if (ipv & CEPH_PICK_ADDRESS_IPV6) {
+	ipv6_r = fill_in_one_address(cct, ifa, CEPH_PICK_ADDRESS_IPV6,
+                                     networks, interfaces, addrs,
+                                     preferred_numa_node);
       }
-    }
-    if ((ipv & CEPH_PICK_ADDRESS_IPV4) &&
-	!(flags & CEPH_PICK_ADDRESS_PREFER_IPV4)) {
-      int r = fill_in_one_address(cct, ifa, CEPH_PICK_ADDRESS_IPV4, networks, interfaces,
-				  addrs);
-      if (r < 0) {
-	return r;
+      if ((ipv & CEPH_PICK_ADDRESS_IPV4) &&
+	  !(flags & CEPH_PICK_ADDRESS_PREFER_IPV4)) {
+	ipv4_r = fill_in_one_address(cct, ifa, CEPH_PICK_ADDRESS_IPV4,
+                                     networks, interfaces, addrs,
+                                     preferred_numa_node);
       }
+      if (ipv4_r >= 0 && ipv6_r >= 0) {
+	break;
+      }
+      if (preferred_numa_node < 0) {
+	return ipv4_r >= 0 && ipv6_r >= 0 ? 0 : -1;
+      }
+      preferred_numa_node = -1;      // try any numa node
     }
   }
 
@@ -357,7 +392,6 @@ int pick_addresses(
 
   // ipv4 and/or ipv6?
   if (addrs->v.empty()) {
-    entity_addr_t addr;
     addr.set_type(entity_addr_t::TYPE_MSGR2);
     if ((ipv & CEPH_PICK_ADDRESS_IPV4) &&
 	(flags & CEPH_PICK_ADDRESS_PREFER_IPV4)) {
@@ -407,7 +441,8 @@ int pick_addresses(
 int pick_addresses(
   CephContext *cct,
   unsigned flags,
-  entity_addrvec_t *addrs)
+  entity_addrvec_t *addrs,
+  int preferred_numa_node)
 {
   struct ifaddrs *ifa;
   int r = getifaddrs(&ifa);
@@ -418,7 +453,7 @@ int pick_addresses(
 	       <<  cpp_strerror(r) << dendl;
     return r;
   }
-  r = pick_addresses(cct, flags, ifa, addrs);
+  r = pick_addresses(cct, flags, ifa, addrs, preferred_numa_node);
   freeifaddrs(ifa);
   return r;
 }
@@ -433,7 +468,7 @@ std::string pick_iface(CephContext *cct, const struct sockaddr_storage &network)
     return {};
   }
 
-  const unsigned int prefix_len = max(sizeof(in_addr::s_addr), sizeof(in6_addr::s6_addr)) * CHAR_BIT;
+  const unsigned int prefix_len = std::max(sizeof(in_addr::s_addr), sizeof(in6_addr::s6_addr)) * CHAR_BIT;
   const struct ifaddrs *found = find_ip_in_subnet(
     ifa,
     (const struct sockaddr *) &network, prefix_len);
@@ -449,7 +484,7 @@ std::string pick_iface(CephContext *cct, const struct sockaddr_storage &network)
 }
 
 
-bool have_local_addr(CephContext *cct, const list<entity_addr_t>& ls, entity_addr_t *match)
+bool have_local_addr(CephContext *cct, const std::list<entity_addr_t>& ls, entity_addr_t *match)
 {
   struct ifaddrs *ifa;
   int r = getifaddrs(&ifa);
@@ -477,3 +512,76 @@ bool have_local_addr(CephContext *cct, const list<entity_addr_t>& ls, entity_add
   freeifaddrs(ifa);
   return found;
 }
+
+int get_iface_numa_node(
+  const std::string& iface,
+  int *node)
+{
+  enum class iface_t {
+    PHY_PORT,
+    BOND_PORT
+  } ifatype = iface_t::PHY_PORT;
+  std::string_view ifa{iface};
+  if (auto pos = ifa.find(":"); pos != ifa.npos) {
+    ifa.remove_suffix(ifa.size() - pos);
+  }
+  string fn = fmt::format("/sys/class/net/{}/device/numa_node", ifa);
+  int fd = ::open(fn.c_str(), O_RDONLY);
+  if (fd < 0) {
+    fn = fmt::format("/sys/class/net/{}/bonding/slaves", ifa);
+    fd = ::open(fn.c_str(), O_RDONLY);
+    if (fd < 0) {
+      return -errno;
+    }
+    ifatype = iface_t::BOND_PORT;
+  }
+
+  int r = 0;
+  char buf[1024];
+  char *endptr = 0;
+  r = safe_read(fd, &buf, sizeof(buf));
+  if (r < 0) {
+    goto out;
+  }
+  buf[r] = 0;
+  while (r > 0 && ::isspace(buf[--r])) {
+    buf[r] = 0;
+  }
+
+  switch (ifatype) {
+  case iface_t::PHY_PORT:
+    *node = strtoll(buf, &endptr, 10);
+    if (endptr != buf + strlen(buf)) {
+      r = -EINVAL;
+      goto out;
+    }
+    r = 0;
+    break;
+  case iface_t::BOND_PORT:
+    int bond_node = -1;
+    std::vector<std::string> sv;
+    std::string ifacestr = buf;
+    get_str_vec(ifacestr, " ", sv);
+    for (auto& iter : sv) {
+      int bn = -1;
+      r = get_iface_numa_node(iter, &bn);
+      if (r >= 0) {
+        if (bond_node == -1 || bn == bond_node) {
+          bond_node = bn;
+        } else {
+          *node = -2;
+          goto out;
+        }
+      } else {
+        goto out;
+      }
+    }
+    *node = bond_node;
+    break;
+  }
+
+  out:
+  ::close(fd);
+  return r;
+}
+

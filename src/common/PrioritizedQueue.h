@@ -202,7 +202,7 @@ public:
       min_cost(min_c)
   {}
 
-  unsigned length() const final {
+  unsigned length() const {
     unsigned total = 0;
     for (typename SubQueues::const_iterator i = queue.begin();
 	 i != queue.end();
@@ -342,6 +342,10 @@ public:
       f->close_section();
     }
     f->close_section();
+  }
+
+  void print(std::ostream &ostream) const final {
+    ostream << "PrioritizedQueue";
   }
 };
 

@@ -12,12 +12,10 @@ function run() {
     export CEPH_ARGS
     CEPH_ARGS+="--fsid=$(uuidgen) --auth-supported=none "
     CEPH_ARGS+="--mon-host=$CEPH_MON "
-    CEPH_ARGS+="--bluestore_block_size=4294967296 "
+    CEPH_ARGS+="--bluestore_block_size=2147483648 "
     CEPH_ARGS+="--bluestore_block_db_create=true "
     CEPH_ARGS+="--bluestore_block_db_size=1073741824 "
     CEPH_ARGS+="--bluestore_block_wal_size=536870912 "
-    CEPH_ARGS+="--bluestore_bluefs_min=536870912 "
-    CEPH_ARGS+="--bluestore_bluefs_min_free=536870912 "
     CEPH_ARGS+="--bluestore_block_wal_create=true "
     CEPH_ARGS+="--bluestore_fsck_on_mount=true "
     local funcs=${@:-$(set | sed -n -e 's/^\(TEST_[0-9a-z_]*\) .*/\1/p')}
@@ -38,13 +36,13 @@ function TEST_bluestore() {
 
     run_mon $dir a || return 1
     run_mgr $dir x || return 1
-    run_osd_bluestore $dir 0 || return 1
+    run_osd $dir 0 || return 1
     osd_pid0=$(cat $dir/osd.0.pid)
-    run_osd_bluestore $dir 1 || return 1
+    run_osd $dir 1 || return 1
     osd_pid1=$(cat $dir/osd.1.pid)
-    run_osd_bluestore $dir 2 || return 1
+    run_osd $dir 2 || return 1
     osd_pid2=$(cat $dir/osd.2.pid)
-    run_osd_bluestore $dir 3 || return 1
+    run_osd $dir 3 || return 1
     osd_pid3=$(cat $dir/osd.3.pid)
 
     sleep 5
@@ -66,8 +64,26 @@ function TEST_bluestore() {
     while kill $osd_pid3; do sleep 1 ; done
     ceph osd down 3
 
+    # expand slow devices
+    ceph-bluestore-tool --path $dir/0 fsck || return 1
+    ceph-bluestore-tool --path $dir/1 fsck || return 1
+    ceph-bluestore-tool --path $dir/2 fsck || return 1
+    ceph-bluestore-tool --path $dir/3 fsck || return 1
+
+    truncate $dir/0/block -s 4294967296 # 4GB
+    ceph-bluestore-tool --path $dir/0 bluefs-bdev-expand || return 1
+    truncate $dir/1/block -s 4311744512 # 4GB + 16MB
+    ceph-bluestore-tool --path $dir/1 bluefs-bdev-expand || return 1
+    truncate $dir/2/block -s 4295099392 # 4GB + 129KB
+    ceph-bluestore-tool --path $dir/2 bluefs-bdev-expand || return 1
+    truncate $dir/3/block -s 4293918720 # 4GB - 1MB
+    ceph-bluestore-tool --path $dir/3 bluefs-bdev-expand || return 1
+
     # slow, DB, WAL -> slow, DB
     ceph-bluestore-tool --path $dir/0 fsck || return 1
+    ceph-bluestore-tool --path $dir/1 fsck || return 1
+    ceph-bluestore-tool --path $dir/2 fsck || return 1
+    ceph-bluestore-tool --path $dir/3 fsck || return 1
 
     ceph-bluestore-tool --path $dir/0 bluefs-bdev-sizes
 
@@ -122,13 +138,13 @@ function TEST_bluestore() {
 
     ceph-bluestore-tool --path $dir/3 fsck || return 1
 
-    run_osd_bluestore $dir 0 || return 1
+    activate_osd $dir 0 || return 1
     osd_pid0=$(cat $dir/osd.0.pid)
-    run_osd_bluestore $dir 1 || return 1
+    activate_osd $dir 1 || return 1
     osd_pid1=$(cat $dir/osd.1.pid)
-    run_osd_bluestore $dir 2 || return 1
+    activate_osd $dir 2 || return 1
     osd_pid2=$(cat $dir/osd.2.pid)
-    run_osd_bluestore $dir 3 || return 1
+    activate_osd $dir 3 || return 1
     osd_pid3=$(cat $dir/osd.3.pid)
 
     wait_for_clean || return 1
@@ -200,13 +216,13 @@ function TEST_bluestore() {
 
     ceph-bluestore-tool --path $dir/3 fsck || return 1
 
-    run_osd_bluestore $dir 0 || return 1
+    activate_osd $dir 0 || return 1
     osd_pid0=$(cat $dir/osd.0.pid)
-    run_osd_bluestore $dir 1 || return 1
+    activate_osd $dir 1 || return 1
     osd_pid1=$(cat $dir/osd.1.pid)
-    run_osd_bluestore $dir 2 || return 1
+    activate_osd $dir 2 || return 1
     osd_pid2=$(cat $dir/osd.2.pid)
-    run_osd_bluestore $dir 3 || return 1
+    activate_osd $dir 3 || return 1
     osd_pid3=$(cat $dir/osd.3.pid)
 
     # write some objects
@@ -306,13 +322,13 @@ function TEST_bluestore() {
 
     ceph-bluestore-tool --path $dir/3 fsck || return 1
 
-    run_osd_bluestore $dir 0 || return 1
+    activate_osd $dir 0 || return 1
     osd_pid0=$(cat $dir/osd.0.pid)
-    run_osd_bluestore $dir 1 || return 1
+    activate_osd $dir 1 || return 1
     osd_pid1=$(cat $dir/osd.1.pid)
-    run_osd_bluestore $dir 2 || return 1
+    activate_osd $dir 2 || return 1
     osd_pid2=$(cat $dir/osd.2.pid)
-    run_osd_bluestore $dir 3 || return 1
+    activate_osd $dir 3 || return 1
     osd_pid3=$(cat $dir/osd.3.pid)
 
     # write some objects

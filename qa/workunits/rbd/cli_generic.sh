@@ -125,6 +125,9 @@ test_others() {
     rbd info --snap=snap1 testimg1 2>&1 | grep 'error setting snapshot context: (2) No such file or directory'
     rbd info --snap=snap1 testimg-diff1 2>&1 | grep 'error setting snapshot context: (2) No such file or directory'
 
+    # sparsify
+    rbd sparsify testimg1
+
     remove_images
     rm -f $TMP_FILES
 }
@@ -552,6 +555,7 @@ test_clone_v2() {
     rbd clone --rbd-default-clone-format=1 test1@1 test4
 
     rbd children test1@1 | sort | tr '\n' ' ' | grep -E "test2.*test3.*test4"
+    rbd children --descendants test1 | sort | tr '\n' ' ' | grep -E "test2.*test3.*test4"
 
     rbd remove test4
     rbd snap unprotect test1@1
@@ -572,6 +576,21 @@ test_clone_v2() {
     rbd snap list --all test1 | wc -l | grep '^0$'
     rbd rm test1
     rbd rm test2
+
+    rbd create $RBD_CREATE_ARGS -s 1 test1
+    rbd snap create test1@1
+    rbd snap create test1@2
+    rbd clone test1@1 test2 --rbd-default-clone-format 2
+    rbd clone test1@2 test3 --rbd-default-clone-format 2
+    rbd snap rm test1@1
+    rbd snap rm test1@2
+    expect_fail rbd rm test1
+    rbd rm test1 --rbd-move-parent-to-trash-on-remove=true
+    rbd trash ls -a | grep test1
+    rbd rm test2
+    rbd trash ls -a | grep test1
+    rbd rm test3
+    rbd trash ls -a | expect_fail grep test1
 }
 
 test_thick_provision() {
@@ -631,10 +650,10 @@ test_namespace() {
     remove_images
 
     rbd namespace ls | wc -l | grep '^0$'
-    rbd namespace create rbd test1
-    rbd namespace create --pool rbd test2
+    rbd namespace create rbd/test1
+    rbd namespace create --pool rbd --namespace test2
     rbd namespace create --namespace test3
-    expect_fail rbd namespace create rbd test3
+    expect_fail rbd namespace create rbd/test3
 
     rbd namespace list | grep 'test' | wc -l | grep '^3$'
 
@@ -661,8 +680,18 @@ test_namespace() {
     rbd rm rbd/test2/image2
     rbd rm rbd/image2
 
+    # v1 clones are supported within the same namespace
+    rbd create $RBD_CREATE_ARGS --size 1G rbd/test1/image3
+    rbd snap create rbd/test1/image3@1
+    rbd snap protect rbd/test1/image3@1
+    rbd clone --rbd-default-clone-format 1 rbd/test1/image3@1 rbd/test1/image4
+    rbd rm rbd/test1/image4
+    rbd snap unprotect rbd/test1/image3@1
+    rbd snap rm rbd/test1/image3@1
+    rbd rm rbd/test1/image3
+
     rbd create $RBD_CREATE_ARGS --size 1G --namespace test1 image2
-    expect_fail rbd namespace remove --pool rbd test1
+    expect_fail rbd namespace remove rbd/test1
 
     rbd group create rbd/test1/group1
     rbd group image add rbd/test1/group1 rbd/test1/image1
@@ -674,11 +703,11 @@ test_namespace() {
 
     rbd remove rbd/test1/image2
 
-    rbd namespace remove --pool rbd test1
+    rbd namespace remove --pool rbd --namespace test1
     rbd namespace remove --namespace test3
 
     rbd namespace list | grep 'test' | wc -l | grep '^1$'
-    rbd namespace remove rbd test2
+    rbd namespace remove rbd/test2
 }
 
 get_migration_state() {
@@ -725,8 +754,8 @@ test_migration() {
     rbd migration commit test1
 
     # Migration to other namespace
-    rbd namespace create rbd2 ns1
-    rbd namespace create rbd2 ns2
+    rbd namespace create rbd2/ns1
+    rbd namespace create rbd2/ns2
     rbd migration prepare rbd2/test1 rbd2/ns1/test1
     test "$(get_migration_state rbd2/ns1/test1)" = prepared
     rbd migration execute rbd2/test1
@@ -742,6 +771,58 @@ test_migration() {
     rbd info test1 | grep 'data_pool: rbd2'
     rbd migration execute test1
     rbd migration commit test1
+
+    # testing trash
+    rbd migration prepare test1
+    expect_fail rbd trash mv test1
+    ID=`rbd trash ls -a | cut -d ' ' -f 1`
+    expect_fail rbd trash rm $ID
+    expect_fail rbd trash restore $ID
+    rbd migration abort test1
+
+    # Migrate parent
+    rbd remove test1
+    dd if=/dev/urandom bs=1M count=1 | rbd --image-format 2 import - test1
+    md5sum=$(rbd export test1 - | md5sum)
+    rbd snap create test1@snap1
+    rbd snap protect test1@snap1
+    rbd snap create test1@snap2
+    rbd clone test1@snap1 clone_v1 --rbd_default_clone_format=1
+    rbd clone test1@snap2 clone_v2 --rbd_default_clone_format=2
+    rbd info clone_v1 | fgrep 'parent: rbd/test1@snap1'
+    rbd info clone_v2 | fgrep 'parent: rbd/test1@snap2'
+    rbd info clone_v2 |grep 'op_features: clone-child'
+    test "$(rbd export clone_v1 - | md5sum)" = "${md5sum}"
+    test "$(rbd export clone_v2 - | md5sum)" = "${md5sum}"
+    test "$(rbd children test1@snap1)" = "rbd/clone_v1"
+    test "$(rbd children test1@snap2)" = "rbd/clone_v2"
+    rbd migration prepare test1 rbd2/test2
+    rbd info clone_v1 | fgrep 'parent: rbd2/test2@snap1'
+    rbd info clone_v2 | fgrep 'parent: rbd2/test2@snap2'
+    rbd info clone_v2 | fgrep 'op_features: clone-child'
+    test "$(rbd children rbd2/test2@snap1)" = "rbd/clone_v1"
+    test "$(rbd children rbd2/test2@snap2)" = "rbd/clone_v2"
+    rbd migration execute test1
+    expect_fail rbd migration commit test1
+    rbd migration commit test1 --force
+    test "$(rbd export clone_v1 - | md5sum)" = "${md5sum}"
+    test "$(rbd export clone_v2 - | md5sum)" = "${md5sum}"
+    rbd migration prepare rbd2/test2 test1
+    rbd info clone_v1 | fgrep 'parent: rbd/test1@snap1'
+    rbd info clone_v2 | fgrep 'parent: rbd/test1@snap2'
+    rbd info clone_v2 | fgrep 'op_features: clone-child'
+    test "$(rbd children test1@snap1)" = "rbd/clone_v1"
+    test "$(rbd children test1@snap2)" = "rbd/clone_v2"
+    rbd migration execute test1
+    expect_fail rbd migration commit test1
+    rbd migration commit test1 --force
+    test "$(rbd export clone_v1 - | md5sum)" = "${md5sum}"
+    test "$(rbd export clone_v2 - | md5sum)" = "${md5sum}"
+    rbd remove clone_v1
+    rbd remove clone_v2
+    rbd snap unprotect test1@snap1
+    rbd snap purge test1
+    rbd rm test1
 
     for format in 1 2; do
         # Abort migration after successful prepare
@@ -843,6 +924,162 @@ test_config() {
     rbd rm test1
 }
 
+test_trash_purge_schedule() {
+    echo "testing trash purge schedule..."
+    remove_images
+    ceph osd pool create rbd2 8
+    rbd pool init rbd2
+    rbd namespace create rbd2/ns1
+
+    expect_fail rbd trash purge schedule ls
+    test "$(rbd trash purge schedule ls -R --format json)" = "[]"
+
+    rbd trash purge schedule add -p rbd 1d 01:30
+
+    rbd trash purge schedule ls -p rbd | grep 'every 1d starting at 01:30'
+    expect_fail rbd trash purge schedule ls
+    rbd trash purge schedule ls -R | grep 'every 1d starting at 01:30'
+    rbd trash purge schedule ls -R -p rbd | grep 'every 1d starting at 01:30'
+    expect_fail rbd trash purge schedule ls -p rbd2
+    test "$(rbd trash purge schedule ls -p rbd2 -R --format json)" = "[]"
+
+    rbd trash purge schedule add -p rbd2/ns1 2d
+    test "$(rbd trash purge schedule ls -p rbd2 -R --format json)" != "[]"
+    rbd trash purge schedule ls -p rbd2 -R | grep 'rbd2 *ns1 *every 2d'
+    rbd trash purge schedule rm -p rbd2/ns1
+    test "$(rbd trash purge schedule ls -p rbd2 -R --format json)" = "[]"
+
+    for i in `seq 12`; do
+        test "$(rbd trash purge schedule status --format xml |
+            $XMLSTARLET sel -t -v '//scheduled/item/pool')" = 'rbd' && break
+        sleep 10
+    done
+    rbd trash purge schedule status
+    test "$(rbd trash purge schedule status --format xml |
+        $XMLSTARLET sel -t -v '//scheduled/item/pool')" = 'rbd'
+
+    rbd trash purge schedule add 2d 00:17
+    rbd trash purge schedule ls | grep 'every 2d starting at 00:17'
+    rbd trash purge schedule ls -R | grep 'every 2d starting at 00:17'
+    expect_fail rbd trash purge schedule ls -p rbd2
+    rbd trash purge schedule ls -p rbd2 -R | grep 'every 2d starting at 00:17'
+    rbd trash purge schedule ls -p rbd2/ns1 -R | grep 'every 2d starting at 00:17'
+    test "$(rbd trash purge schedule ls -R -p rbd2/ns1 --format xml |
+        $XMLSTARLET sel -t -v '//schedules/schedule/pool')" = "-"
+    test "$(rbd trash purge schedule ls -R -p rbd2/ns1 --format xml |
+        $XMLSTARLET sel -t -v '//schedules/schedule/namespace')" = "-"
+    test "$(rbd trash purge schedule ls -R -p rbd2/ns1 --format xml |
+        $XMLSTARLET sel -t -v '//schedules/schedule/items/item/start_time')" = "00:17:00"
+
+    for i in `seq 12`; do
+        rbd trash purge schedule status --format xml |
+            $XMLSTARLET sel -t -v '//scheduled/item/pool' | grep 'rbd2' && break
+        sleep 10
+    done
+    rbd trash purge schedule status
+    rbd trash purge schedule status --format xml |
+        $XMLSTARLET sel -t -v '//scheduled/item/pool' | grep 'rbd2'
+
+    test "$(echo $(rbd trash purge schedule ls -R --format xml |
+        $XMLSTARLET sel -t -v '//schedules/schedule/items'))" = "2d00:17:00 1d01:30:00"
+
+    rbd trash purge schedule add 1d
+    rbd trash purge schedule ls | grep 'every 2d starting at 00:17'
+    rbd trash purge schedule ls | grep 'every 1d'
+
+    rbd trash purge schedule ls -R --format xml |
+        $XMLSTARLET sel -t -v '//schedules/schedule/items' | grep '2d00:17'
+
+    rbd trash purge schedule rm 1d
+    rbd trash purge schedule ls | grep 'every 2d starting at 00:17'
+    rbd trash purge schedule rm 2d 00:17
+    expect_fail rbd trash purge schedule ls
+
+    for p in rbd2 rbd2/ns1; do
+        rbd create $RBD_CREATE_ARGS -s 1 rbd2/ns1/test1
+        rbd trash mv rbd2/ns1/test1
+        rbd trash ls rbd2/ns1 | wc -l | grep '^1$'
+
+        rbd trash purge schedule add -p $p 1m
+        rbd trash purge schedule list -p rbd2/ns1 -R | grep 'every 1m'
+
+        for i in `seq 12`; do
+            rbd trash ls rbd2/ns1 | wc -l | grep '^1$' || break
+            sleep 10
+        done
+        rbd trash ls rbd2/ns1 | wc -l | grep '^0$'
+
+        rbd trash purge schedule status | grep 'rbd2  *ns1'
+        rbd trash purge schedule rm -p $p 1m
+    done
+
+    rbd trash purge schedule remove -p rbd 1d 01:30
+    test "$(rbd trash purge schedule ls -R --format json)" = "[]"
+
+    remove_images
+    ceph osd pool rm rbd2 rbd2 --yes-i-really-really-mean-it
+}
+
+test_mirror_snapshot_schedule() {
+    echo "testing mirror snapshot schedule..."
+    remove_images
+    ceph osd pool create rbd2 8
+    rbd pool init rbd2
+    rbd namespace create rbd2/ns1
+
+    rbd mirror pool enable rbd2 image
+    rbd mirror pool enable rbd2/ns1 image
+    rbd mirror pool peer add rbd2 cluster1
+
+    expect_fail rbd mirror snapshot schedule ls
+    test "$(rbd mirror snapshot schedule ls -R --format json)" = "[]"
+
+    rbd create $RBD_CREATE_ARGS -s 1 rbd2/ns1/test1
+
+    test "$(rbd mirror image status rbd2/ns1/test1 |
+        grep -c mirror.primary)" = '0'
+
+    rbd mirror image enable rbd2/ns1/test1 snapshot
+
+    test "$(rbd mirror image status rbd2/ns1/test1 |
+        grep -c mirror.primary)" = '1'
+
+    rbd mirror snapshot schedule add --image rbd2/ns1/test1 1m
+    test "$(rbd mirror snapshot schedule ls --image rbd2/ns1/test1)" = 'every 1m'
+
+    for i in `seq 12`; do
+        test "$(rbd mirror image status rbd2/ns1/test1 |
+            grep -c mirror.primary)" -gt '1' && break
+        sleep 10
+    done
+
+    test "$(rbd mirror image status rbd2/ns1/test1 |
+        grep -c mirror.primary)" -gt '1'
+
+    rbd mirror snapshot schedule ls -R | grep 'rbd2 *ns1 *test1 *every 1m'
+    test "$(rbd mirror snapshot schedule ls -p rbd2/ns1 --image test1)" = 'every 1m'
+
+    rbd mirror snapshot schedule status
+    test "$(rbd mirror snapshot schedule status --format xml |
+        $XMLSTARLET sel -t -v '//scheduled_images/image/image')" = 'rbd2/ns1/test1'
+
+    rbd mirror snapshot schedule add 1h 00:15
+    test "$(rbd mirror snapshot schedule ls)" = 'every 1h starting at 00:15:00'
+
+    rbd rm rbd2/ns1/test1
+
+    for i in `seq 12`; do
+        rbd mirror snapshot schedule status | grep 'rbd2/ns1/test1' || break
+        sleep 10
+    done
+
+    rbd mirror snapshot schedule remove
+    test "$(rbd mirror snapshot schedule ls -R --format json)" = "[]"
+
+    remove_images
+    ceph osd pool rm rbd2 rbd2 --yes-i-really-really-mean-it
+}
+
 test_pool_image_args
 test_rename
 test_ls
@@ -863,5 +1100,7 @@ test_deep_copy_clone
 test_clone_v2
 test_thick_provision
 test_namespace
+test_trash_purge_schedule
+test_mirror_snapshot_schedule
 
 echo OK

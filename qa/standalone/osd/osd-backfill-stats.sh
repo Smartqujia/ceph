@@ -55,9 +55,9 @@ function above_margin() {
     return $(( $check >= $target && $check <= $target + $margin ? 0 : 1 ))
 }
 
-FIND_UPACT='grep "pg[[]${PG}.*backfilling.*_update_calc_stats " $log | tail -1 | sed "s/.*[)] \([[][^ p]*\).*$/\1/"'
-FIND_FIRST='grep "pg[[]${PG}.*backfilling.*_update_calc_stats $which " $log | grep -F " ${UPACT}${addp}" | grep -v est | head -1 | sed "s/.* \([0-9]*\)$/\1/"'
-FIND_LAST='grep "pg[[]${PG}.*backfilling.*_update_calc_stats $which " $log | tail -1 | sed "s/.* \([0-9]*\)$/\1/"'
+FIND_UPACT='grep "pg[[]${PG}.*backfilling.*update_calc_stats " $log | tail -1 | sed "s/.*[)] \([[][^ p]*\).*$/\1/"'
+FIND_FIRST='grep "pg[[]${PG}.*backfilling.*update_calc_stats $which " $log | grep -F " ${UPACT}${addp}" | grep -v est | head -1 | sed "s/.* \([0-9]*\)$/\1/"'
+FIND_LAST='grep "pg[[]${PG}.*backfilling.*update_calc_stats $which " $log | tail -1 | sed "s/.* \([0-9]*\)$/\1/"'
 
 function check() {
     local dir=$1
@@ -70,13 +70,17 @@ function check() {
     local misplaced_end=$8
     local primary_start=${9:-}
     local primary_end=${10:-}
+    local check_setup=${11:-true}
 
     local log=$(grep -l +backfilling $dir/osd.$primary.log)
-    test -n "$log" || return 1
-    if [ "$(echo "$log" | wc -w)" != "1" ];
+    if [ $check_setup = "true" ];
     then
-      echo "Test setup failure, a single OSD should have performed backfill"
-      return 1
+      local alllogs=$(grep -l +backfilling $dir/osd.*.log)
+      if [ "$(echo "$alllogs" | wc -w)" != "1" ];
+      then
+        echo "Test setup failure, a single OSD should have performed backfill"
+        return 1
+      fi
     fi
 
     local addp=" "
@@ -139,7 +143,7 @@ function TEST_backfill_sizeup() {
     run_osd $dir 5 || return 1
 
     create_pool $poolname 1 1
-    ceph osd pool set $poolname size 1
+    ceph osd pool set $poolname size 1 --yes-i-really-mean-it
 
     wait_for_clean || return 1
 
@@ -148,8 +152,10 @@ function TEST_backfill_sizeup() {
 	rados -p $poolname put obj$i /dev/null
     done
 
+    ceph osd set nobackfill
     ceph osd pool set $poolname size 3
-    sleep 15
+    sleep 2
+    ceph osd unset nobackfill
 
     wait_for_clean || return 1
 
@@ -185,7 +191,7 @@ function TEST_backfill_sizeup_out() {
     run_osd $dir 5 || return 1
 
     create_pool $poolname 1 1
-    ceph osd pool set $poolname size 1
+    ceph osd pool set $poolname size 1 --yes-i-really-mean-it
 
     wait_for_clean || return 1
 
@@ -198,9 +204,11 @@ function TEST_backfill_sizeup_out() {
     # Remember primary during the backfill
     local primary=$(get_primary $poolname obj1)
 
+    ceph osd set nobackfill
     ceph osd out osd.$primary
     ceph osd pool set $poolname size 3
-    sleep 15
+    sleep 2
+    ceph osd unset nobackfill
 
     wait_for_clean || return 1
 
@@ -245,8 +253,10 @@ function TEST_backfill_out() {
     # Remember primary during the backfill
     local primary=$(get_primary $poolname obj1)
 
+    ceph osd set nobackfill
     ceph osd out osd.$(get_not_primary $poolname obj1)
-    sleep 15
+    sleep 2
+    ceph osd unset nobackfill
 
     wait_for_clean || return 1
 
@@ -292,10 +302,12 @@ function TEST_backfill_down_out() {
     local primary=$(get_primary $poolname obj1)
     local otherosd=$(get_not_primary $poolname obj1)
 
+    ceph osd set nobackfill
     kill $(cat $dir/osd.${otherosd}.pid)
     ceph osd down osd.${otherosd}
     ceph osd out osd.${otherosd}
-    sleep 15
+    sleep 2
+    ceph osd unset nobackfill
 
     wait_for_clean || return 1
 
@@ -349,6 +361,7 @@ function TEST_backfill_out2() {
     sleep 2
     primary=$(get_primary $poolname obj1)
     ceph osd unset nobackfill
+    ceph tell osd.$primary get_latest_osdmap
     ceph tell osd.$primary debug kick_recovery_wq 0
     sleep 2
 
@@ -406,6 +419,7 @@ function TEST_backfill_sizeup4_allout() {
     sleep 2
     primary=$(get_primary $poolname obj1)
     ceph osd unset nobackfill
+    ceph tell osd.$primary get_latest_osdmap
     ceph tell osd.$primary debug kick_recovery_wq 0
     sleep 2
 
@@ -470,6 +484,7 @@ function TEST_backfill_remapped() {
     primary=$(get_primary $poolname obj1)
 
     ceph osd unset nobackfill
+    ceph tell osd.$primary get_latest_osdmap
     ceph tell osd.$primary debug kick_recovery_wq 0
 
     sleep 2
@@ -478,7 +493,7 @@ function TEST_backfill_remapped() {
 
     local misplaced=$(expr $objects \* 2)
 
-    check $dir $PG $primary replicated 0 0 $misplaced $objects || return 1
+    check $dir $PG $primary replicated 0 0 $misplaced $objects "" "" false || return 1
 
     delete_pool $poolname
     kill_daemons $dir || return 1
@@ -530,6 +545,7 @@ function TEST_backfill_ec_all_out() {
     sleep 2
     primary=$(get_primary $poolname obj1)
     ceph osd unset nobackfill
+    ceph tell osd.$primary get_latest_osdmap
     ceph tell osd.$primary debug kick_recovery_wq 0
     sleep 2
 
@@ -580,6 +596,7 @@ function TEST_backfill_ec_prim_out() {
     sleep 2
     primary=$(get_primary $poolname obj1)
     ceph osd unset nobackfill
+    ceph tell osd.$primary get_latest_osdmap
     ceph tell osd.$primary debug kick_recovery_wq 0
     sleep 2
 
@@ -638,6 +655,7 @@ function TEST_backfill_ec_down_all_out() {
     sleep 2
     primary=$(get_primary $poolname obj1)
     ceph osd unset nobackfill
+    ceph tell osd.$primary get_latest_osdmap
     ceph tell osd.$primary debug kick_recovery_wq 0
     sleep 2
     flush_pg_stats
@@ -722,6 +740,7 @@ function TEST_backfill_ec_down_out() {
     sleep 2
     primary=$(get_primary $poolname obj1)
     ceph osd unset nobackfill
+    ceph tell osd.$primary get_latest_osdmap
     ceph tell osd.$primary debug kick_recovery_wq 0
     sleep 2
 

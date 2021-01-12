@@ -11,7 +11,7 @@
 
 #include "include/buffer_fwd.h"
 
-// helpers shared by librados and librados-cxx tests
+// helpers shared by librados tests
 std::string get_temp_pool_name(const std::string &prefix = "test-rados-api-");
 void assert_eq_sparse(ceph::bufferlist& expected,
                       const std::map<uint64_t, uint64_t>& extents,
@@ -19,12 +19,21 @@ void assert_eq_sparse(ceph::bufferlist& expected,
 class TestAlarm
 {
 public:
+  #ifndef _WIN32
   TestAlarm() {
     alarm(1200);
   }
   ~TestAlarm() {
     alarm(0);
   }
+  #else
+  // TODO: add a timeout mechanism for Windows as well, possibly by using
+  // CreateTimerQueueTimer.
+  TestAlarm() {
+  }
+  ~TestAlarm() {
+  }
+  #endif
 };
 
 template<class Rep, class Period, typename Func, typename... Args,

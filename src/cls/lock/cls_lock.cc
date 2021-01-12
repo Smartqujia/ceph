@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <map>
+#include <sstream>
 
 #include "include/types.h"
 #include "include/utime.h"
@@ -25,9 +26,11 @@
 
 #include "include/compat.h"
 
+using std::map;
+using std::string;
 
+using ceph::bufferlist;
 using namespace rados::cls::lock;
-
 
 CLS_VER(1,0)
 CLS_NAME(lock)
@@ -66,7 +69,7 @@ static int read_lock(cls_method_context_t hctx,
   try {
     auto it = bl.cbegin();
     decode(*lock, it);
-  } catch (const buffer::error &err) {
+  } catch (const ceph::buffer::error &err) {
     CLS_ERR("error decoding %s", key.c_str());
     return -EIO;
   }
@@ -75,7 +78,7 @@ static int read_lock(cls_method_context_t hctx,
 
   utime_t now = ceph_clock_now();
 
-  map<locker_id_t, locker_info_t>::iterator iter = lock->lockers.begin();
+  auto iter = lock->lockers.begin();
 
   while (iter != lock->lockers.end()) {
     struct locker_info_t& info = iter->second;
@@ -166,8 +169,7 @@ static int lock_obj(cls_method_context_t hctx,
     return r;
   }
 
-  map<locker_id_t, locker_info_t>& lockers = linfo.lockers;
-  map<locker_id_t, locker_info_t>::iterator iter;
+  auto& lockers = linfo.lockers;
 
   locker_id_t id;
   id.cookie = cookie;
@@ -185,7 +187,7 @@ static int lock_obj(cls_method_context_t hctx,
 
   ClsLockType existing_lock_type = linfo.lock_type;
   CLS_LOG(20, "existing_lock_type=%s", cls_lock_type_str(existing_lock_type));
-  iter = lockers.find(id);
+  auto iter = lockers.find(id);
   if (iter != lockers.end()) {
     if (fail_if_exists && !fail_if_does_not_exist) {
       return -EEXIST;
@@ -198,7 +200,14 @@ static int lock_obj(cls_method_context_t hctx,
 
   if (!lockers.empty()) {
     if (exclusive) {
-      CLS_LOG(20, "could not exclusive-lock object, already locked");
+      auto locker_lister =
+	[&lockers]() -> std::string {
+	  std::stringstream locker_list;
+	  locker_list << lockers;
+	  return locker_list.str();
+	};
+      CLS_LOG(20, "could not exclusive-lock object, already locked by %s",
+	      locker_lister().c_str());
       return -EBUSY;
     }
 
@@ -216,6 +225,13 @@ static int lock_obj(cls_method_context_t hctx,
     expiration += duration;
 
   }
+  // make all addrs of type legacy, because v2 clients speak v2 or v1,
+  // even depending on which OSD they are talking to, and the type
+  // isn't what uniquely identifies them.  also, storing a v1 addr
+  // here means that old clients who get this locker_info won't see an
+  // old "msgr2:" prefix.
+  inst.addr.set_type(entity_addr_t::TYPE_LEGACY);
+
   struct locker_info_t info(expiration, inst.addr, description);
 
   linfo.lockers[id] = info;
@@ -244,7 +260,7 @@ static int lock_op(cls_method_context_t hctx,
   try {
     auto iter = in->cbegin();
     decode(op, iter);
-  } catch (const buffer::error &err) {
+  } catch (const ceph::buffer::error &err) {
     return -EINVAL;
   }
 
@@ -276,12 +292,14 @@ static int remove_lock(cls_method_context_t hctx,
     return r;
   }
 
-  map<locker_id_t, locker_info_t>& lockers = linfo.lockers;
+  auto& lockers = linfo.lockers;
   struct locker_id_t id(locker, cookie);
 
   // remove named locker from set
-  map<locker_id_t, locker_info_t>::iterator iter = lockers.find(id);
+  auto iter = lockers.find(id);
   if (iter == lockers.end()) { // no such key
+    CLS_LOG(10, "locker %s [name: %s.%ld, cookie: %s] does not exist", name.c_str(), 
+            locker.type_str(), locker.num(), cookie.c_str());
     return -ENOENT;
   }
   lockers.erase(iter);
@@ -314,7 +332,7 @@ static int unlock_op(cls_method_context_t hctx,
   try {
     auto iter = in->cbegin();
     decode(op, iter);
-  } catch (const buffer::error& err) {
+  } catch (const ceph::buffer::error& err) {
     return -EINVAL;
   }
 
@@ -342,7 +360,7 @@ static int break_lock(cls_method_context_t hctx,
   try {
     auto iter = in->cbegin();
     decode(op, iter);
-  } catch (const buffer::error& err) {
+  } catch (const ceph::buffer::error& err) {
     return -EINVAL;
   }
 
@@ -368,7 +386,7 @@ static int get_info(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
   try {
     auto iter = in->cbegin();
     decode(op, iter);
-  } catch (const buffer::error& err) {
+  } catch (const ceph::buffer::error& err) {
     return -EINVAL;
   }
 
@@ -382,8 +400,7 @@ static int get_info(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 
   struct cls_lock_get_info_reply ret;
 
-  map<locker_id_t, locker_info_t>::iterator iter;
-  for (iter = linfo.lockers.begin(); iter != linfo.lockers.end(); ++iter) {
+  for (auto iter = linfo.lockers.begin(); iter != linfo.lockers.end(); ++iter) {
     ret.lockers[iter->first] = iter->second;
   }
   ret.lock_type = linfo.lock_type;
@@ -418,9 +435,8 @@ static int list_locks(cls_method_context_t hctx, bufferlist *in, bufferlist *out
 
   cls_lock_list_locks_reply ret;
 
-  map<string, bufferlist>::iterator iter;
   size_t pos = sizeof(LOCK_PREFIX) - 1;
-  for (iter = attrs.begin(); iter != attrs.end(); ++iter) {
+  for (auto iter = attrs.begin(); iter != attrs.end(); ++iter) {
     const string& attr = iter->first;
     if (attr.substr(0, pos).compare(LOCK_PREFIX) == 0) {
       ret.locks.push_back(attr.substr(pos));
@@ -451,7 +467,7 @@ int assert_locked(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
   try {
     auto iter = in->cbegin();
     decode(op, iter);
-  } catch (const buffer::error& err) {
+  } catch (const ceph::buffer::error& err) {
     return -EINVAL;
   }
 
@@ -496,7 +512,7 @@ int assert_locked(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
   id.cookie = op.cookie;
   id.locker = inst.name;
 
-  map<locker_id_t, locker_info_t>::iterator iter = linfo.lockers.find(id);
+  auto iter = linfo.lockers.find(id);
   if (iter == linfo.lockers.end()) {
     CLS_LOG(20, "not locked by assert client");
     return -EBUSY;
@@ -523,7 +539,7 @@ int set_cookie(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
   try {
     auto iter = in->cbegin();
     decode(op, iter);
-  } catch (const buffer::error& err) {
+  } catch (const ceph::buffer::error& err) {
     return -EINVAL;
   }
 

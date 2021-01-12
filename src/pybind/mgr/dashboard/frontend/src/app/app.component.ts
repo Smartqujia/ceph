@@ -1,9 +1,6 @@
-import { Component, ViewContainerRef } from '@angular/core';
-import { Router } from '@angular/router';
+import { Component } from '@angular/core';
 
-import { ToastsManager } from 'ng2-toastr';
-
-import { AuthStorageService } from './shared/services/auth-storage.service';
+import { NgbPopoverConfig, NgbTooltipConfig } from '@ng-bootstrap/ng-bootstrap';
 
 @Component({
   selector: 'cd-root',
@@ -11,22 +8,11 @@ import { AuthStorageService } from './shared/services/auth-storage.service';
   styleUrls: ['./app.component.scss']
 })
 export class AppComponent {
-  title = 'cd';
+  constructor(popoverConfig: NgbPopoverConfig, tooltipConfig: NgbTooltipConfig) {
+    popoverConfig.autoClose = 'outside';
+    popoverConfig.container = 'body';
+    popoverConfig.placement = 'bottom';
 
-  constructor(
-    private authStorageService: AuthStorageService,
-    private router: Router,
-    public toastr: ToastsManager,
-    private vcr: ViewContainerRef
-  ) {
-    this.toastr.setRootViewContainerRef(this.vcr);
-  }
-
-  isLoginActive() {
-    return this.router.url === '/login' || !this.authStorageService.isLoggedIn();
-  }
-
-  isDashboardPage() {
-    return this.router.url === '/dashboard';
+    tooltipConfig.container = 'body';
   }
 }

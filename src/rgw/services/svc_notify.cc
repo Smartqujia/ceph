@@ -1,4 +1,8 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab ft=cpp
+
 #include "include/random.h"
+#include "include/Context.h"
 #include "common/errno.h"
 
 #include "svc_notify.h"
@@ -91,7 +95,7 @@ public:
       register_completion->release();
       register_completion = nullptr;
     }
-    register_completion = librados::Rados::aio_create_completion(nullptr, nullptr, nullptr);
+    register_completion = librados::Rados::aio_create_completion(nullptr, nullptr);
     register_ret = obj.aio_watch(register_completion, &watch_handle, this);
     if (register_ret < 0) {
       register_completion->release();
@@ -107,7 +111,7 @@ public:
     if (!register_completion) {
       return -EINVAL;
     }
-    register_completion->wait_for_safe();
+    register_completion->wait_for_complete();
     int r = register_completion->get_return_value();
     register_completion->release();
     register_completion = nullptr;
@@ -147,6 +151,7 @@ string RGWSI_Notify::get_control_oid(int i)
   return string(buf);
 }
 
+// do not call pick_obj_control before init_watch
 RGWSI_RADOS::Obj RGWSI_Notify::pick_control_obj(const string& key)
 {
   uint32_t r = ceph_str_hash_linux(key.c_str(), key.size());
@@ -155,7 +160,7 @@ RGWSI_RADOS::Obj RGWSI_Notify::pick_control_obj(const string& key)
   return notify_objs[i];
 }
 
-int RGWSI_Notify::init_watch()
+int RGWSI_Notify::init_watch(optional_yield y)
 {
   num_watchers = cct->_conf->rgw_num_control_oids;
 
@@ -179,7 +184,7 @@ int RGWSI_Notify::init_watch()
       notify_oid = notify_oid_prefix;
     }
 
-    notify_objs[i] = rados_svc->handle(0).obj({control_pool, notify_oid});
+    notify_objs[i] = rados_svc->handle().obj({control_pool, notify_oid});
     auto& notify_obj = notify_objs[i];
 
     int r = notify_obj.open();
@@ -190,7 +195,7 @@ int RGWSI_Notify::init_watch()
 
     librados::ObjectWriteOperation op;
     op.create(false);
-    r = notify_obj.operate(&op);
+    r = notify_obj.operate(&op, y);
     if (r < 0 && r != -EEXIST) {
       ldout(cct, 0) << "ERROR: notify_obj.operate() returned r=" << r << dendl;
       return r;
@@ -233,27 +238,27 @@ void RGWSI_Notify::finalize_watch()
   delete[] watchers;
 }
 
-int RGWSI_Notify::do_start()
+int RGWSI_Notify::do_start(optional_yield y)
 {
-  int r = zone_svc->start();
+  int r = zone_svc->start(y);
   if (r < 0) {
     return r;
   }
 
   assert(zone_svc->is_started()); /* otherwise there's an ordering problem */
 
-  r = rados_svc->start();
+  r = rados_svc->start(y);
   if (r < 0) {
     return r;
   }
-  r = finisher_svc->start();
+  r = finisher_svc->start(y);
   if (r < 0) {
     return r;
   }
 
   control_pool = zone_svc->get_zone_params().control_pool;
 
-  int ret = init_watch();
+  int ret = init_watch(y);
   if (ret < 0) {
     lderr(cct) << "ERROR: failed to initialize watch: " << cpp_strerror(-ret) << dendl;
     return ret;
@@ -295,7 +300,7 @@ int RGWSI_Notify::unwatch(RGWSI_RADOS::Obj& obj, uint64_t watch_handle)
     ldout(cct, 0) << "ERROR: rados->unwatch2() returned r=" << r << dendl;
     return r;
   }
-  r = rados_svc->handle(0).watch_flush();
+  r = rados_svc->handle().watch_flush();
   if (r < 0) {
     ldout(cct, 0) << "ERROR: rados->watch_flush() returned r=" << r << dendl;
     return r;
@@ -306,7 +311,7 @@ int RGWSI_Notify::unwatch(RGWSI_RADOS::Obj& obj, uint64_t watch_handle)
 void RGWSI_Notify::add_watcher(int i)
 {
   ldout(cct, 20) << "add_watcher() i=" << i << dendl;
-  RWLock::WLocker l(watchers_lock);
+  std::unique_lock l{watchers_lock};
   watchers_set.insert(i);
   if (watchers_set.size() ==  (size_t)num_watchers) {
     ldout(cct, 2) << "all " << num_watchers << " watchers are set, enabling cache" << dendl;
@@ -317,7 +322,7 @@ void RGWSI_Notify::add_watcher(int i)
 void RGWSI_Notify::remove_watcher(int i)
 {
   ldout(cct, 20) << "remove_watcher() i=" << i << dendl;
-  RWLock::WLocker l(watchers_lock);
+  std::unique_lock l{watchers_lock};
   size_t orig_size = watchers_set.size();
   watchers_set.erase(i);
   if (orig_size == (size_t)num_watchers &&
@@ -332,7 +337,7 @@ int RGWSI_Notify::watch_cb(uint64_t notify_id,
                            uint64_t notifier_id,
                            bufferlist& bl)
 {
-  RWLock::RLocker l(watchers_lock);
+  std::shared_lock l{watchers_lock};
   if (cb) {
     return cb->watch_cb(notify_id, cookie, notifier_id, bl);
   }
@@ -341,7 +346,7 @@ int RGWSI_Notify::watch_cb(uint64_t notify_id,
 
 void RGWSI_Notify::set_enabled(bool status)
 {
-  RWLock::WLocker l(watchers_lock);
+  std::unique_lock l{watchers_lock};
   _set_enabled(status);
 }
 
@@ -353,22 +358,34 @@ void RGWSI_Notify::_set_enabled(bool status)
   }
 }
 
-int RGWSI_Notify::distribute(const string& key, bufferlist& bl)
+int RGWSI_Notify::distribute(const string& key, bufferlist& bl,
+                             optional_yield y)
 {
-  RGWSI_RADOS::Obj notify_obj = pick_control_obj(key);
+  /* The RGW uses the control pool to store the watch notify objects.
+    The precedence in RGWSI_Notify::do_start is to call to zone_svc->start and later to init_watch().
+    The first time, RGW starts in the cluster, the RGW will try to create zone and zonegroup system object.
+    In that case RGW will try to distribute the cache before it ran init_watch,
+    which will lead to division by 0 in pick_obj_control (num_watchers is 0).
+  */
+  if (num_watchers > 0) {
+    RGWSI_RADOS::Obj notify_obj = pick_control_obj(key);
 
-  ldout(cct, 10) << "distributing notification oid=" << notify_obj.get_ref().oid << " bl.length()=" << bl.length() << dendl;
-  return robust_notify(notify_obj, bl);
+    ldout(cct, 10) << "distributing notification oid=" << notify_obj.get_ref().obj
+        << " bl.length()=" << bl.length() << dendl;
+    return robust_notify(notify_obj, bl, y);
+  }
+  return 0;
 }
 
-int RGWSI_Notify::robust_notify(RGWSI_RADOS::Obj& notify_obj, bufferlist& bl)
+int RGWSI_Notify::robust_notify(RGWSI_RADOS::Obj& notify_obj, bufferlist& bl,
+                                optional_yield y)
 {
   // The reply of every machine that acks goes in here.
   boost::container::flat_set<std::pair<uint64_t, uint64_t>> acks;
   bufferlist rbl;
 
   // First, try to send, without being fancy about it.
-  auto r = notify_obj.notify(bl, 0, &rbl);
+  auto r = notify_obj.notify(bl, 0, &rbl, y);
 
   // If that doesn't work, get serious.
   if (r < 0) {
@@ -389,7 +406,7 @@ int RGWSI_Notify::robust_notify(RGWSI_RADOS::Obj& notify_obj, bufferlist& bl)
 	ldout(cct, 20) << "robust_notify: acked by " << id << dendl;
 	uint32_t blen;
 	decode(blen, p);
-	p.advance(blen);
+	p += blen;
       }
     } catch (const buffer::error& e) {
       ldout(cct, 0) << "robust_notify: notify response parse failed: "
@@ -408,7 +425,7 @@ int RGWSI_Notify::robust_notify(RGWSI_RADOS::Obj& notify_obj, bufferlist& bl)
       rbl.clear();
       // Reset the timeouts, we're only concerned with new ones.
       timeouts.clear();
-      r = notify_obj.notify(bl, 0, &rbl);
+      r = notify_obj.notify(bl, 0, &rbl, y);
       if (r < 0) {
 	ldout(cct, 1) << "robust_notify: retry " << tries << " failed: "
 		      << cpp_strerror(-r) << dendl;
@@ -428,7 +445,7 @@ int RGWSI_Notify::robust_notify(RGWSI_RADOS::Obj& notify_obj, bufferlist& bl)
 	    }
 	    uint32_t blen;
 	    decode(blen, p);
-	    p.advance(blen);
+	    p += blen;
 	  }
 
 	  uint32_t num_timeouts;
@@ -462,7 +479,7 @@ int RGWSI_Notify::robust_notify(RGWSI_RADOS::Obj& notify_obj, bufferlist& bl)
 
 void RGWSI_Notify::register_watch_cb(CB *_cb)
 {
-  RWLock::WLocker l(watchers_lock);
+  std::unique_lock l{watchers_lock};
   cb = _cb;
   _set_enabled(enabled);
 }

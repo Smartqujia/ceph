@@ -2,7 +2,7 @@ import datetime
 import json
 import re
 import threading
-import six
+
 from mgr_module import MgrModule, CommandResult
 from . import health as health_util
 
@@ -121,7 +121,7 @@ class Module(MgrModule):
         """Filter hourly health reports timestamp"""
         matches = filter(
             lambda t: f(health_util.HealthHistorySlot.key_to_time(t[0])),
-            six.iteritems(self.get_store_prefix(health_util.HEALTH_HISTORY_KEY_PREFIX)))
+            self.get_store_prefix(health_util.HEALTH_HISTORY_KEY_PREFIX).items())
         return map(lambda t: t[0], matches)
 
     def _health_prune_history(self, hours):
@@ -130,6 +130,8 @@ class Module(MgrModule):
         for key in self._health_filter(lambda ts: ts <= cutoff):
             self.log.info("Removing old health slot key {}".format(key))
             self.set_store(key, None)
+        if not hours:
+            self._health_slot = health_util.HealthHistorySlot()
 
     def _health_report(self, hours):
         """
@@ -162,14 +164,14 @@ class Module(MgrModule):
         constituent components, such as when Ceph has been built with
         ENABLE_GIT_VERSION=OFF.
         """
-        r = "ceph version (?P<release>\d+)\.(?P<major>\d+)\.(?P<minor>\d+)"
+        r = r"ceph version (?P<release>\d+)\.(?P<major>\d+)\.(?P<minor>\d+)"
         m = re.match(r, version)
         ver = {} if not m else {
             "release": m.group("release"),
             "major": m.group("major"),
             "minor": m.group("minor")
         }
-        return { k:int(v) for k,v in six.iteritems(ver) }
+        return { k:int(v) for k,v in ver.items() }
 
     def _crash_history(self, hours):
         """
@@ -199,6 +201,27 @@ class Module(MgrModule):
                 json.dumps(result["summary"], indent=2)))
 
         return result, health_check_details
+
+    def _apply_osd_stats(self, osd_map):
+        # map from osd id to its index in the map structure
+        osd_id_to_idx = {}
+        for idx in range(len(osd_map["osds"])):
+            osd_id_to_idx[osd_map["osds"][idx]["osd"]] = idx
+
+        # include stats, including space utilization performance counters.
+        # adapted from dashboard api controller
+        for s in self.get('osd_stats')['osd_stats']:
+            try:
+                idx = osd_id_to_idx[s["osd"]]
+                osd_map["osds"][idx].update({'osd_stats': s})
+            except KeyError as e:
+                self.log.warning("inconsistent api state: {}".format(str(e)))
+
+        for osd in osd_map["osds"]:
+            osd['stats'] = {}
+            for s in ['osd.numpg', 'osd.stat_bytes', 'osd.stat_bytes_used']:
+                osd['stats'][s.split('.')[1]] = self.get_latest('osd', str(osd["osd"]), s)
+
 
     def _config_dump(self):
         """Report cluster configuration
@@ -241,6 +264,7 @@ class Module(MgrModule):
 
         osd_map = self.get("osd_map")
         del osd_map['pg_temp']
+        self._apply_osd_stats(osd_map)
         report["osd_dump"] = osd_map
 
         report["df"] = self.get("df")
@@ -285,7 +309,10 @@ class Module(MgrModule):
         the selftest module to manage testing scenarios related to tracking
         health history.
         """
-        hours = long(hours)
+        try:
+            hours = long(hours)
+        except NameError:
+            hours = int(hours)
         health_util.NOW_OFFSET = datetime.timedelta(hours = hours)
         self.log.warning("Setting now time offset {}".format(health_util.NOW_OFFSET))
 

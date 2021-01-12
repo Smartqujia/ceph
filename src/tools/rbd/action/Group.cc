@@ -47,7 +47,7 @@ void add_group_option(po::options_description *opt,
 }
 
 void add_prefixed_pool_option(po::options_description *opt,
-                            const std::string &prefix) {
+                              const std::string &prefix) {
   std::string name = prefix + "-" + at::POOL_NAME;
   std::string description = prefix + " pool name";
 
@@ -75,13 +75,13 @@ void add_group_spec_options(po::options_description *pos,
     pos->add_options()
       ((get_name_prefix(modifier) + GROUP_SPEC).c_str(),
        (get_description_prefix(modifier) + "group specification\n" +
-         "(example: [<pool-name>/[<namespace-name>/]]<group-name>)").c_str());
+         "(example: [<pool-name>/[<namespace>/]]<group-name>)").c_str());
   } else {
     add_snap_option(opt, modifier);
     pos->add_options()
       ((get_name_prefix(modifier) + GROUP_SNAP_SPEC).c_str(),
        (get_description_prefix(modifier) + "group specification\n" +
-         "(example: [<pool-name>/[<namespace-name>/]]<group-name>@<snap-name>)").c_str());
+         "(example: [<pool-name>/[<namespace>/]]<group-name>@<snap-name>)").c_str());
   }
 }
 
@@ -120,13 +120,17 @@ int execute_create(const po::variables_map &vm,
 
 int execute_list(const po::variables_map &vm,
                  const std::vector<std::string> &ceph_global_init_args) {
-
+  std::string pool_name;
+  std::string namespace_name;
   size_t arg_index = 0;
-  std::string pool_name = utils::get_pool_name(vm, &arg_index);
-  std::string namespace_name = utils::get_namespace_name(vm, &arg_index);
+  int r = utils::get_pool_and_namespace_names(vm, true, false, &pool_name,
+                                              &namespace_name, &arg_index);
+  if (r < 0) {
+    return r;
+  }
 
   at::Format::Formatter formatter;
-  int r = utils::get_formatter(vm, &formatter);
+  r = utils::get_formatter(vm, &formatter);
   if (r < 0) {
     return r;
   }
@@ -501,6 +505,12 @@ int execute_group_snap_create(const po::variables_map &vm,
     return r;
   }
 
+  uint32_t flags;
+  r = utils::get_snap_create_flags(vm, &flags);
+  if (r < 0) {
+    return r;
+  }
+
   librados::IoCtx io_ctx;
   librados::Rados rados;
 
@@ -510,7 +520,8 @@ int execute_group_snap_create(const po::variables_map &vm,
   }
 
   librbd::RBD rbd;
-  r = rbd.group_snap_create(io_ctx, group_name.c_str(), snap_name.c_str());
+  r = rbd.group_snap_create2(io_ctx, group_name.c_str(), snap_name.c_str(),
+                             flags);
   if (r < 0) {
     return r;
   }
@@ -748,8 +759,7 @@ void get_remove_arguments(po::options_description *positional,
 
 void get_list_arguments(po::options_description *positional,
                         po::options_description *options) {
-  at::add_pool_option(options, at::ARGUMENT_MODIFIER_NONE);
-  at::add_namespace_options(nullptr, options);
+  at::add_pool_options(positional, options, true);
   at::add_format_options(options);
 }
 
@@ -766,7 +776,7 @@ void get_add_arguments(po::options_description *positional,
   positional->add_options()
     (GROUP_SPEC.c_str(),
      "group specification\n"
-     "(example: [<pool-name>/[<namespace-name>/]]<group-name>)");
+     "(example: [<pool-name>/[<namespace>/]]<group-name>)");
 
   add_prefixed_pool_option(options, "group");
   add_prefixed_namespace_option(options, "group");
@@ -775,7 +785,7 @@ void get_add_arguments(po::options_description *positional,
   positional->add_options()
     (at::IMAGE_SPEC.c_str(),
      "image specification\n"
-     "(example: [<pool-name>/[<namespace-name>/]]<image-name>)");
+     "(example: [<pool-name>/[<namespace>/]]<image-name>)");
 
   add_prefixed_pool_option(options, "image");
   add_prefixed_namespace_option(options, "image");
@@ -790,7 +800,7 @@ void get_remove_image_arguments(po::options_description *positional,
   positional->add_options()
     (GROUP_SPEC.c_str(),
      "group specification\n"
-     "(example: [<pool-name>/[<namespace-name>/]]<group-name>)");
+     "(example: [<pool-name>/[<namespace>/]]<group-name>)");
 
   add_prefixed_pool_option(options, "group");
   add_prefixed_namespace_option(options, "group");
@@ -799,7 +809,7 @@ void get_remove_image_arguments(po::options_description *positional,
   positional->add_options()
     (at::IMAGE_SPEC.c_str(),
      "image specification\n"
-     "(example: [<pool-name>/[<namespace-name>/]]<image-name>)");
+     "(example: [<pool-name>/[<namespace>/]]<image-name>)");
 
   add_prefixed_pool_option(options, "image");
   add_prefixed_namespace_option(options, "image");
@@ -818,9 +828,10 @@ void get_list_images_arguments(po::options_description *positional,
 }
 
 void get_group_snap_create_arguments(po::options_description *positional,
-				  po::options_description *options) {
+                                     po::options_description *options) {
   add_group_spec_options(positional, options, at::ARGUMENT_MODIFIER_NONE,
                          true);
+  at::add_snap_create_options(options);
 }
 
 void get_group_snap_remove_arguments(po::options_description *positional,
@@ -836,7 +847,7 @@ void get_group_snap_rename_arguments(po::options_description *positional,
 
   positional->add_options()
     (at::DEST_SNAPSHOT_NAME.c_str(),
-     "destination snapshot name\n(example: <snapshot-name>)");
+     "destination snapshot name\n(example: <snap-name>)");
   at::add_snap_option(options, at::ARGUMENT_MODIFIER_DEST);
 }
 

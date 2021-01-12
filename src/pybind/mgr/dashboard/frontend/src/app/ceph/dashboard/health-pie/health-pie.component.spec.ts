@@ -1,9 +1,10 @@
 import { NO_ERRORS_SCHEMA } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 
-import { configureTestBed } from '../../../../testing/unit-test-helper';
-import { DimlessBinaryPipe } from '../../../shared/pipes/dimless-binary.pipe';
-import { FormatterService } from '../../../shared/services/formatter.service';
+import { DimlessBinaryPipe } from '~/app/shared/pipes/dimless-binary.pipe';
+import { DimlessPipe } from '~/app/shared/pipes/dimless.pipe';
+import { FormatterService } from '~/app/shared/services/formatter.service';
+import { configureTestBed } from '~/testing/unit-test-helper';
 import { HealthPieComponent } from './health-pie.component';
 
 describe('HealthPieComponent', () => {
@@ -13,7 +14,7 @@ describe('HealthPieComponent', () => {
   configureTestBed({
     schemas: [NO_ERRORS_SCHEMA],
     declarations: [HealthPieComponent],
-    providers: [DimlessBinaryPipe, FormatterService]
+    providers: [DimlessBinaryPipe, DimlessPipe, FormatterService]
   });
 
   beforeEach(() => {
@@ -25,45 +26,49 @@ describe('HealthPieComponent', () => {
     expect(component).toBeTruthy();
   });
 
-  it('Set doughnut if nothing received', () => {
-    component.chartType = '';
-    fixture.detectChanges();
-
-    expect(component.chart.chartType).toEqual('doughnut');
-  });
-
-  it('Set doughnut if not allowed value received', () => {
-    component.chartType = 'badType';
-    fixture.detectChanges();
-
-    expect(component.chart.chartType).toEqual('doughnut');
-  });
-
-  it('Set doughnut if doughnut received', () => {
-    component.chartType = 'doughnut';
-    fixture.detectChanges();
-
-    expect(component.chart.chartType).toEqual('doughnut');
-  });
-
-  it('Set pie if pie received', () => {
-    component.chartType = 'pie';
-    fixture.detectChanges();
-
-    expect(component.chart.chartType).toEqual('pie');
-  });
-
-  it('Remove slice border if there is only one slice with non zero value', () => {
-    component.chart.dataset[0].data = [48, 0, 0, 0];
+  it('Add slice border if there is more than one slice with numeric non zero value', () => {
+    component.chartConfig.dataset[0].data = [48, 0, 1, 0];
     component.ngOnChanges();
 
-    expect(component.chart.dataset[0].borderWidth).toEqual(0);
+    expect(component.chartConfig.dataset[0].borderWidth).toEqual(1);
   });
 
-  it('Keep slice border if there is more than one slice with non zero value', () => {
-    component.chart.dataset[0].data = [48, 0, 1, 0];
+  it('Remove slice border if there is only one slice with numeric non zero value', () => {
+    component.chartConfig.dataset[0].data = [48, 0, undefined, 0];
     component.ngOnChanges();
 
-    expect(component.chart.dataset[0].borderWidth).toEqual(1);
+    expect(component.chartConfig.dataset[0].borderWidth).toEqual(0);
+  });
+
+  it('Remove slice border if there is no slice with numeric non zero value', () => {
+    component.chartConfig.dataset[0].data = [undefined, 0];
+    component.ngOnChanges();
+
+    expect(component.chartConfig.dataset[0].borderWidth).toEqual(0);
+  });
+
+  it('should not hide any slice if there is no user click on legend item', () => {
+    const initialData = [8, 15];
+    component.chartConfig.dataset[0].data = initialData;
+    component.ngOnChanges();
+
+    expect(component.chartConfig.dataset[0].data).toEqual(initialData);
+  });
+
+  describe('tooltip body', () => {
+    const tooltipBody = ['text: 10000'];
+
+    it('should return amount converted to appropriate units', () => {
+      component.isBytesData = false;
+      expect(component['getChartTooltipBody'](tooltipBody)).toEqual('text: 10 k');
+
+      component.isBytesData = true;
+      expect(component['getChartTooltipBody'](tooltipBody)).toEqual('text: 9.8 KiB');
+    });
+
+    it('should not return amount when showing label as tooltip', () => {
+      component.showLabelAsTooltip = true;
+      expect(component['getChartTooltipBody'](tooltipBody)).toEqual('text');
+    });
   });
 });

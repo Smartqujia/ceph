@@ -194,14 +194,21 @@ int JournalScanner::scan_events()
       }
 
       objects_missing.push_back(obj_offset);
-      gap = true;
-      gap_start = read_offset;
+      if (!gap) {
+        gap_start = read_offset;
+        gap = true;
+      }
+      if (read_buf.length() > 0) {
+        read_offset += read_buf.length();
+        read_buf.clear();
+      }
+      read_offset += object_size - offset_in_obj;
       continue;
     } else {
       dout(4) << "Read 0x" << std::hex << this_object.length() << std::dec
               << " bytes from " << oid << " gap=" << gap << dendl;
       objects_valid.push_back(oid);
-      this_object.copy(0, this_object.length(), read_buf);
+      this_object.begin().copy(this_object.length(), read_buf);
     }
 
     if (gap) {
@@ -229,7 +236,8 @@ int JournalScanner::scan_events()
         }
       } while (read_buf.length() >= sizeof(JournalStream::sentinel));
       dout(4) << "read_buf size is " << read_buf.length() << dendl;
-    } else {
+    } 
+    {
       dout(10) << "Parsing data, 0x" << std::hex << read_buf.length() << std::dec << " bytes available" << dendl;
       while(true) {
         // TODO: detect and handle legacy format journals: can do many things
@@ -276,15 +284,15 @@ int JournalScanner::scan_events()
         }
         bool valid_entry = true;
         if (is_mdlog) {
-          LogEvent *le = LogEvent::decode(le_bl);
+          auto le = LogEvent::decode_event(le_bl.cbegin());
 
           if (le) {
             dout(10) << "Valid entry at 0x" << std::hex << read_offset << std::dec << dendl;
 
             if (le->get_type() == EVENT_SUBTREEMAP
                 || le->get_type() == EVENT_SUBTREEMAP_TEST) {
-              ESubtreeMap *sle = dynamic_cast<ESubtreeMap*>(le);
-              if (sle->expire_pos > read_offset) {
+              auto&& sle = dynamic_cast<ESubtreeMap&>(*le);
+              if (sle.expire_pos > read_offset) {
                 errors.insert(std::make_pair(
                       read_offset, EventError(
                         -ERANGE,
@@ -293,22 +301,18 @@ int JournalScanner::scan_events()
             }
 
             if (filter.apply(read_offset, *le)) {
-              events[read_offset] = EventRecord(le, consumed);
-            } else {
-              delete le;
+              events.insert_or_assign(read_offset, EventRecord(std::move(le), consumed));
             }
           } else {
             valid_entry = false;
           }
         } else if (type == "purge_queue"){
-           PurgeItem* pi = new PurgeItem();
+           auto pi = std::make_unique<PurgeItem>();
            try {
              auto q = le_bl.cbegin();
              pi->decode(q);
 	     if (filter.apply(read_offset, *pi)) {
-	       events[read_offset] = EventRecord(pi, consumed);
-	     } else {
-	       delete pi;
+	       events.insert_or_assign(read_offset, EventRecord(std::move(pi), consumed));
 	     }
            } catch (const buffer::error &err) {
              valid_entry = false;
@@ -351,12 +355,6 @@ JournalScanner::~JournalScanner()
     header = NULL;
   }
   dout(4) << events.size() << " events" << dendl;
-  for (EventMap::iterator i = events.begin(); i != events.end(); ++i) {
-    if (i->second.log_event)
-      delete i->second.log_event;
-    else if (i->second.pi)
-      delete i->second.pi;
-  }
   events.clear();
 }
 

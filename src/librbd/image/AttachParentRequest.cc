@@ -1,10 +1,9 @@
-// -*- mode:C++; tab-width:8; c-basic-offattach:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #include "librbd/image/AttachParentRequest.h"
 #include "common/dout.h"
 #include "common/errno.h"
-#include "common/WorkQueue.h"
 #include "cls/rbd/cls_rbd_client.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/Utils.h"
@@ -17,7 +16,6 @@
 namespace librbd {
 namespace image {
 
-using util::create_context_callback;
 using util::create_rados_callback;
 
 template <typename I>
@@ -28,12 +26,12 @@ void AttachParentRequest<I>::send() {
 template <typename I>
 void AttachParentRequest<I>::attach_parent() {
   auto cct = m_image_ctx.cct;
-  ldout(cct, 5) << dendl;
+  ldout(cct, 5) << "parent_image_spec=" << m_parent_image_spec << dendl;
 
   librados::ObjectWriteOperation op;
   if (!m_legacy_parent) {
     librbd::cls_client::parent_attach(&op, m_parent_image_spec,
-                                      m_parent_overlap);
+                                      m_parent_overlap, m_reattach);
   } else {
     librbd::cls_client::set_parent(&op, m_parent_image_spec, m_parent_overlap);
   }
@@ -51,7 +49,7 @@ void AttachParentRequest<I>::handle_attach_parent(int r) {
   auto cct = m_image_ctx.cct;
   ldout(cct, 5) << dendl;
 
-  if (!m_legacy_parent && r == -EOPNOTSUPP) {
+  if (!m_legacy_parent && r == -EOPNOTSUPP && !m_reattach) {
     if (m_parent_image_spec.pool_namespace ==
           m_image_ctx.md_ctx.get_namespace()) {
       m_parent_image_spec.pool_namespace = "";

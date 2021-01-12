@@ -1,12 +1,10 @@
+from contextlib import contextmanager
 from datetime import datetime
 from threading import Event, Thread
 from itertools import chain
-from six import next
-from six.moves import queue
-from six.moves import xrange as range
+import queue
 import json
 import errno
-import six
 import time
 
 from mgr_module import MgrModule
@@ -20,7 +18,7 @@ except ImportError:
 
 
 class Module(MgrModule):
-    OPTIONS = [
+    MODULE_OPTIONS = [
             {
                 'name': 'hostname',
                 'default': None
@@ -66,7 +64,7 @@ class Module(MgrModule):
     @property
     def config_keys(self):
         return dict((o['name'], o.get('default', None))
-                for o in self.OPTIONS)
+                for o in self.MODULE_OPTIONS)
 
     COMMANDS = [
         {
@@ -130,9 +128,8 @@ class Module(MgrModule):
                     break
 
                 start = time.time()
-                client = self.get_influx_client()
-                client.write_points(points, time_precision='ms')
-                client.close()
+                with self.get_influx_client() as client:
+                    client.write_points(points, time_precision='ms')
                 runtime = time.time() - start
                 self.log.debug('Writing points %d to Influx took %.3f seconds',
                                len(points), runtime)
@@ -178,12 +175,12 @@ class Module(MgrModule):
         pool_info = {}
 
         df_types = [
-            'bytes_used',
+            'stored',
             'kb_used',
             'dirty',
             'rd',
             'rd_bytes',
-            'raw_bytes_used',
+            'stored_raw',
             'wr',
             'wr_bytes',
             'objects',
@@ -214,7 +211,7 @@ class Module(MgrModule):
     def get_pg_summary_osd(self, pool_info, now):
         pg_sum = self.get('pg_summary')
         osd_sum = pg_sum['by_osd']
-        for osd_id, stats in six.iteritems(osd_sum):
+        for osd_id, stats in osd_sum.items():
             metadata = self.get_metadata('osd', "%s" % osd_id)
             if not metadata:
                 continue
@@ -235,7 +232,7 @@ class Module(MgrModule):
 
     def get_pg_summary_pool(self, pool_info, now):
         pool_sum = self.get('pg_summary')['by_pool']
-        for pool_id, stats in six.iteritems(pool_sum):
+        for pool_id, stats in pool_sum.items():
             for stat in stats:
                 yield {
                     "measurement": "ceph_pg_summary_pool",
@@ -251,7 +248,7 @@ class Module(MgrModule):
                 }
 
     def get_daemon_stats(self, now):
-        for daemon, counters in six.iteritems(self.get_all_perf_counters()):
+        for daemon, counters in self.get_all_perf_counters().items():
             svc_type, svc_id = daemon.split(".", 1)
             metadata = self.get_metadata(svc_type, svc_id)
 
@@ -301,28 +298,28 @@ class Module(MgrModule):
 
     def init_module_config(self):
         self.config['hostname'] = \
-            self.get_config("hostname", default=self.config_keys['hostname'])
+            self.get_module_option("hostname", default=self.config_keys['hostname'])
         self.config['port'] = \
-            int(self.get_config("port", default=self.config_keys['port']))
+            int(self.get_module_option("port", default=self.config_keys['port']))
         self.config['database'] = \
-            self.get_config("database", default=self.config_keys['database'])
+            self.get_module_option("database", default=self.config_keys['database'])
         self.config['username'] = \
-            self.get_config("username", default=self.config_keys['username'])
+            self.get_module_option("username", default=self.config_keys['username'])
         self.config['password'] = \
-            self.get_config("password", default=self.config_keys['password'])
+            self.get_module_option("password", default=self.config_keys['password'])
         self.config['interval'] = \
-            int(self.get_config("interval",
+            int(self.get_module_option("interval",
                                 default=self.config_keys['interval']))
         self.config['threads'] = \
-            int(self.get_config("threads",
+            int(self.get_module_option("threads",
                                 default=self.config_keys['threads']))
         self.config['batch_size'] = \
-            int(self.get_config("batch_size",
+            int(self.get_module_option("batch_size",
                                 default=self.config_keys['batch_size']))
-        ssl = self.get_config("ssl", default=self.config_keys['ssl'])
+        ssl = self.get_module_option("ssl", default=self.config_keys['ssl'])
         self.config['ssl'] = ssl.lower() == 'true'
         verify_ssl = \
-            self.get_config("verify_ssl", default=self.config_keys['verify_ssl'])
+            self.get_module_option("verify_ssl", default=self.config_keys['verify_ssl'])
         self.config['verify_ssl'] = verify_ssl.lower() == 'true'
 
     def gather_statistics(self):
@@ -332,14 +329,23 @@ class Module(MgrModule):
                      self.get_pg_summary_osd(pools, now),
                      self.get_pg_summary_pool(pools, now))
 
+    @contextmanager
     def get_influx_client(self):
-        return InfluxDBClient(self.config['hostname'],
-                                     self.config['port'],
-                                     self.config['username'],
-                                     self.config['password'],
-                              self.config['database'],
-                                     self.config['ssl'],
-                                     self.config['verify_ssl'])
+        client = InfluxDBClient(self.config['hostname'],
+                                self.config['port'],
+                                self.config['username'],
+                                self.config['password'],
+                                self.config['database'],
+                                self.config['ssl'],
+                                self.config['verify_ssl'])
+        try:
+            yield client
+        finally:
+            try:
+                client.close()
+            except AttributeError:
+                # influxdb older than v5.0.0
+                pass
 
     def send_to_influx(self):
         if not self.config['hostname']:
@@ -360,21 +366,20 @@ class Module(MgrModule):
         self.log.debug("Sending data to Influx host: %s",
                        self.config['hostname'])
         try:
-            client = self.get_influx_client()
-            databases = client.get_list_database()
-            if {'name': self.config['database']} not in databases:
-                self.log.info("Database '%s' not found, trying to create "
-                              "(requires admin privs). You can also create "
-                              "manually and grant write privs to user "
-                              "'%s'", self.config['database'],
-                              self.config['database'])
-                client.create_database(self.config['database'])
-                client.create_retention_policy(name='8_weeks',
-                                               duration='8w',
-                                               replication='1',
-                                               default=True,
-                                               database=self.config['database'])
-            client.close()
+            with self.get_influx_client() as client:
+                databases = client.get_list_database()
+                if {'name': self.config['database']} not in databases:
+                    self.log.info("Database '%s' not found, trying to create "
+                                  "(requires admin privs). You can also create "
+                                  "manually and grant write privs to user "
+                                  "'%s'", self.config['database'],
+                                  self.config['database'])
+                    client.create_database(self.config['database'])
+                    client.create_retention_policy(name='8_weeks',
+                                                   duration='8w',
+                                                   replication='1',
+                                                   default=True,
+                                                   database=self.config['database'])
 
             self.log.debug('Gathering statistics')
             points = self.gather_statistics()
@@ -431,11 +436,11 @@ class Module(MgrModule):
             'df_stats': df_stats
         }
 
-        return json.dumps(result, indent=2)
+        return json.dumps(result, indent=2, sort_keys=True)
 
     def handle_command(self, inbuf, cmd):
         if cmd['prefix'] == 'influx config-show':
-            return 0, json.dumps(self.config), ''
+            return 0, json.dumps(self.config, sort_keys=True), ''
         elif cmd['prefix'] == 'influx config-set':
             key = cmd['key']
             value = cmd['value']
@@ -444,7 +449,7 @@ class Module(MgrModule):
 
             self.log.debug('Setting configuration option %s to %s', key, value)
             self.set_config_option(key, value)
-            self.set_config(key, value)
+            self.set_module_option(key, value)
             return 0, 'Configuration option {0} updated'.format(key), ''
         elif cmd['prefix'] == 'influx send':
             self.send_to_influx()

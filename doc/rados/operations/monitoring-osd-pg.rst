@@ -33,7 +33,9 @@ not assign placement groups to the OSD. If an OSD is ``down``, it should also be
 .. note:: If an OSD is ``down`` and ``in``, there is a problem and the cluster 
    will not be in a healthy state.
 
-.. ditaa:: +----------------+        +----------------+
+.. ditaa::
+
+           +----------------+        +----------------+
            |                |        |                |
            |   OSD #n In    |        |   OSD #n Up    |
            |                |        |                |
@@ -107,9 +109,15 @@ requires three replicas of a placement group, CRUSH may assign them to
 ``osd.1``, ``osd.2`` and ``osd.3`` respectively. CRUSH actually seeks a
 pseudo-random placement that will take into account failure domains you set in
 your `CRUSH map`_, so you will rarely see placement groups assigned to nearest
-neighbor OSDs in a large cluster. We refer to the set of OSDs that should
-contain the replicas of a particular placement group as the **Acting Set**. In
-some cases, an OSD in the Acting Set is ``down`` or otherwise not able to
+neighbor OSDs in a large cluster.
+
+Ceph processes a client request using the **Acting Set**, which is the set of
+OSDs that will actually handle the requests since they have a full and working
+version of a placement group shard. The set of OSDs that should contain a shard
+of a particular placement group as the **Up Set**, i.e. where data is
+moved/copied to (or planned to be).
+
+In some cases, an OSD in the Acting Set is ``down`` or otherwise not able to
 service requests for objects in the placement group. When these situations
 arise, don't panic. Common examples include:
 
@@ -120,12 +128,10 @@ arise, don't panic. Common examples include:
 - An OSD in the Acting Set is ``down`` or unable to service requests, 
   and another OSD has temporarily assumed its duties.
 
-Ceph processes a client request using the **Up Set**, which is the set of OSDs
-that will actually handle the requests. In most cases, the Up Set and the Acting
-Set are virtually identical. When they are not, it may indicate that Ceph is
-migrating data, an OSD is recovering, or that there is a problem (i.e., Ceph
-usually echoes a "HEALTH WARN" state with a "stuck stale" message in such
-scenarios).
+In most cases, the Up Set and the Acting Set are identical. When they are not,
+it may indicate that Ceph is migrating the PG (it's remapped), an OSD is
+recovering, or that there is a problem (i.e., Ceph usually echoes a "HEALTH
+WARN" state with a "stuck stale" message in such scenarios).
 
 To retrieve a list of placement groups, execute:: 
 
@@ -158,7 +164,9 @@ OSDs to establish agreement on the current state of the placement group
 (assuming a pool with 3 replicas of the PG).
 
 
-.. ditaa:: +---------+     +---------+     +-------+
+.. ditaa::
+
+           +---------+     +---------+     +-------+
            |  OSD 1  |     |  OSD 2  |     | OSD 3 |
            +---------+     +---------+     +-------+
                 |               |              |
@@ -228,15 +236,15 @@ few cases:
    Placement group IDs consist of the pool number (not pool name) followed 
    by a period (.) and the placement group ID--a hexadecimal number. You
    can view pool numbers and their names from the output of ``ceph osd 
-   lspools``. For example, the default pool ``rbd`` corresponds to
-   pool number ``0``. A fully qualified placement group ID has the
+   lspools``. For example, the first pool created corresponds to
+   pool number ``1``. A fully qualified placement group ID has the
    following form::
    
    	{pool-num}.{pg-id}
    
    And it typically looks like this:: 
    
-   	0.1f
+	1.1f
    
 
 To retrieve a list of placement groups, execute the following:: 
@@ -265,8 +273,8 @@ group's Acting Set will peer. Once peering is complete, the placement group
 status should be ``active+clean``, which means a Ceph client can begin writing
 to the placement group.
 
-.. ditaa:: 
-         
+.. ditaa::
+
        /-----------\       /-----------\       /-----------\
        | Creating  |------>|  Peering  |------>|  Active   |
        \-----------/       \-----------/       \-----------/
@@ -380,19 +388,24 @@ requests when it is ready.
 
 During the backfill operations, you may see one of several states:
 ``backfill_wait`` indicates that a backfill operation is pending, but is not
-underway yet; ``backfill`` indicates that a backfill operation is underway;
-and, ``backfill_too_full`` indicates that a backfill operation was requested,
+underway yet; ``backfilling`` indicates that a backfill operation is underway;
+and, ``backfill_toofull`` indicates that a backfill operation was requested,
 but couldn't be completed due to insufficient storage capacity. When a 
 placement group cannot be backfilled, it may be considered ``incomplete``.
 
+The ``backfill_toofull`` state may be transient.  It is possible that as PGs
+are moved around, space may become available.  The ``backfill_toofull`` is
+similar to ``backfill_wait`` in that as soon as conditions change
+backfill can proceed.
+
 Ceph provides a number of settings to manage the load spike associated with
 reassigning placement groups to an OSD (especially a new OSD). By default,
-``osd_max_backfills`` sets the maximum number of concurrent backfills to or from
-an OSD to 10. The ``backfill full ratio`` enables an OSD to refuse a
+``osd_max_backfills`` sets the maximum number of concurrent backfills to and from
+an OSD to 1. The ``backfill full ratio`` enables an OSD to refuse a
 backfill request if the OSD is approaching its full ratio (90%, by default) and
 change with ``ceph osd set-backfillfull-ratio`` command.
 If an OSD refuses a backfill request, the ``osd backfill retry interval``
-enables an OSD to retry the request (after 10 seconds, by default). OSDs can
+enables an OSD to retry the request (after 30 seconds, by default). OSDs can
 also set ``osd backfill scan min`` and ``osd backfill scan max`` to manage scan
 intervals (64 and 512, by default).
 
@@ -485,7 +498,7 @@ location, all you need is the object name and the pool name. For example::
    
 	Ceph should output the object's location. For example:: 
    
-		osdmap e537 pool 'data' (0) object 'test-object-1' -> pg 0.d1743484 (0.4) -> up ([1,0], p0) acting ([1,0], p0)
+		osdmap e537 pool 'data' (1) object 'test-object-1' -> pg 1.d1743484 (1.4) -> up ([0,1], p0) acting ([0,1], p0)
    
 	To remove the test object, simply delete it using the ``rados rm`` command.
 	For example:: 

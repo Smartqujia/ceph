@@ -1,16 +1,15 @@
 import { HttpClient, HttpParams } from '@angular/common/http';
 import { Injectable } from '@angular/core';
 
-import * as _ from 'lodash';
+import _ from 'lodash';
 import { forkJoin as observableForkJoin, Observable, of as observableOf } from 'rxjs';
 import { mergeMap } from 'rxjs/operators';
 
 import { cdEncode } from '../decorators/cd-encode';
-import { ApiModule } from './api.module';
 
 @cdEncode
 @Injectable({
-  providedIn: ApiModule
+  providedIn: 'root'
 })
 export class RgwUserService {
   private url = 'api/rgw/user';
@@ -44,6 +43,10 @@ export class RgwUserService {
     return this.http.get(this.url);
   }
 
+  enumerateEmail() {
+    return this.http.get(`${this.url}/get_emails`);
+  }
+
   get(uid: string) {
     return this.http.get(`${this.url}/${uid}`);
   }
@@ -52,7 +55,7 @@ export class RgwUserService {
     return this.http.get(`${this.url}/${uid}/quota`);
   }
 
-  create(args: object) {
+  create(args: Record<string, any>) {
     let params = new HttpParams();
     _.keys(args).forEach((key) => {
       params = params.append(key, args[key]);
@@ -60,7 +63,7 @@ export class RgwUserService {
     return this.http.post(this.url, null, { params: params });
   }
 
-  update(uid: string, args: object) {
+  update(uid: string, args: Record<string, any>) {
     let params = new HttpParams();
     _.keys(args).forEach((key) => {
       params = params.append(key, args[key]);
@@ -68,7 +71,7 @@ export class RgwUserService {
     return this.http.put(`${this.url}/${uid}`, null, { params: params });
   }
 
-  updateQuota(uid: string, args: object) {
+  updateQuota(uid: string, args: Record<string, string>) {
     let params = new HttpParams();
     _.keys(args).forEach((key) => {
       params = params.append(key, args[key]);
@@ -80,7 +83,7 @@ export class RgwUserService {
     return this.http.delete(`${this.url}/${uid}`);
   }
 
-  createSubuser(uid: string, args: object) {
+  createSubuser(uid: string, args: Record<string, string>) {
     let params = new HttpParams();
     _.keys(args).forEach((key) => {
       params = params.append(key, args[key]);
@@ -106,7 +109,7 @@ export class RgwUserService {
     return this.http.delete(`${this.url}/${uid}/capability`, { params: params });
   }
 
-  addS3Key(uid: string, args: object) {
+  addS3Key(uid: string, args: Record<string, string>) {
     let params = new HttpParams();
     params = params.append('key_type', 's3');
     _.keys(args).forEach((key) => {
@@ -131,6 +134,20 @@ export class RgwUserService {
     return this.enumerate().pipe(
       mergeMap((resp: string[]) => {
         const index = _.indexOf(resp, uid);
+        return observableOf(-1 !== index);
+      })
+    );
+  }
+
+  // Using @cdEncodeNot would be the preferred way here, but this
+  // causes an error: https://tracker.ceph.com/issues/37505
+  // Use decodeURIComponent as workaround.
+  // emailExists(@cdEncodeNot email: string): Observable<boolean> {
+  emailExists(email: string): Observable<boolean> {
+    email = decodeURIComponent(email);
+    return this.enumerateEmail().pipe(
+      mergeMap((resp: any[]) => {
+        const index = _.indexOf(resp, email);
         return observableOf(-1 !== index);
       })
     );

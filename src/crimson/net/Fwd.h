@@ -14,23 +14,37 @@
 
 #pragma once
 
-#include <boost/intrusive_ptr.hpp>
+#include <boost/container/small_vector.hpp>
+#include <seastar/core/future.hh>
+#include <seastar/core/future-util.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sharded.hh>
 
+#include "msg/Connection.h"
+#include "msg/MessageRef.h"
 #include "msg/msg_types.h"
-#include "msg/Message.h"
 
-using peer_type_t = int;
+#include "crimson/common/errorator.h"
+
 using auth_proto_t = int;
 
-namespace ceph::net {
+class AuthConnectionMeta;
+using AuthConnectionMetaRef = seastar::lw_shared_ptr<AuthConnectionMeta>;
+
+namespace crimson::net {
 
 using msgr_tag_t = uint8_t;
+using stop_t = seastar::stop_iteration;
 
 class Connection;
-using ConnectionRef = boost::intrusive_ptr<Connection>;
+using ConnectionRef = seastar::shared_ptr<Connection>;
 
 class Dispatcher;
+class ChainedDispatchers;
+constexpr std::size_t NUM_DISPATCHERS = 4u;
+using dispatchers_t = boost::container::small_vector<Dispatcher*, NUM_DISPATCHERS>;
 
 class Messenger;
+using MessengerRef = seastar::shared_ptr<Messenger>;
 
-} // namespace ceph::net
+} // namespace crimson::net

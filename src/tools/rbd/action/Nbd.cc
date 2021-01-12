@@ -21,6 +21,10 @@ namespace po = boost::program_options;
 static int call_nbd_cmd(const po::variables_map &vm,
                         const std::vector<std::string> &args,
                         const std::vector<std::string> &ceph_global_init_args) {
+  #ifdef _WIN32
+  std::cerr << "rbd: nbd device is not supported" << std::endl;
+  return -EOPNOTSUPP;
+  #else
   char exe_path[PATH_MAX];
   ssize_t exe_path_bytes = readlink("/proc/self/exe", exe_path,
 				    sizeof(exe_path) - 1);
@@ -53,15 +57,17 @@ static int call_nbd_cmd(const po::variables_map &vm,
   }
 
   return 0;
+  #endif
 }
 
 int get_image_or_snap_spec(const po::variables_map &vm, std::string *spec) {
   size_t arg_index = 0;
   std::string pool_name;
+  std::string nspace_name;
   std::string image_name;
   std::string snap_name;
   int r = utils::get_pool_image_snapshot_names(
-    vm, at::ARGUMENT_MODIFIER_NONE, &arg_index, &pool_name, nullptr,
+    vm, at::ARGUMENT_MODIFIER_NONE, &arg_index, &pool_name, &nspace_name,
     &image_name, &snap_name, true, utils::SNAPSHOT_PRESENCE_PERMITTED,
     utils::SPEC_VALIDATION_NONE);
   if (r < 0) {
@@ -70,6 +76,10 @@ int get_image_or_snap_spec(const po::variables_map &vm, std::string *spec) {
 
   spec->append(pool_name);
   spec->append("/");
+  if (!nspace_name.empty()) {
+    spec->append(nspace_name);
+    spec->append("/");
+  }
   spec->append(image_name);
   if (!snap_name.empty()) {
     spec->append("@");
@@ -94,7 +104,7 @@ int parse_options(const std::vector<std::string> &options,
 
 int execute_list(const po::variables_map &vm,
                  const std::vector<std::string> &ceph_global_init_args) {
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || defined(_WIN32)
   std::cerr << "rbd: nbd device is not supported" << std::endl;
   return -EOPNOTSUPP;
 #endif
@@ -115,7 +125,7 @@ int execute_list(const po::variables_map &vm,
 
 int execute_map(const po::variables_map &vm,
                 const std::vector<std::string> &ceph_global_init_args) {
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || defined(_WIN32)
   std::cerr << "rbd: nbd device is not supported" << std::endl;
   return -EOPNOTSUPP;
 #endif
@@ -129,12 +139,21 @@ int execute_map(const po::variables_map &vm,
   }
   args.push_back(img);
 
+  if (vm["quiesce"].as<bool>()) {
+    args.push_back("--quiesce");
+  }
+
   if (vm["read-only"].as<bool>()) {
     args.push_back("--read-only");
   }
 
   if (vm["exclusive"].as<bool>()) {
     args.push_back("--exclusive");
+  }
+
+  if (vm.count("quiesce-hook")) {
+    args.push_back("--quiesce-hook");
+    args.push_back(vm["quiesce-hook"].as<std::string>());
   }
 
   if (vm.count("options")) {
@@ -149,7 +168,7 @@ int execute_map(const po::variables_map &vm,
 
 int execute_unmap(const po::variables_map &vm,
                   const std::vector<std::string> &ceph_global_init_args) {
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || defined(_WIN32)
   std::cerr << "rbd: nbd device is not supported" << std::endl;
   return -EOPNOTSUPP;
 #endif
@@ -249,7 +268,7 @@ void get_unmap_arguments_deprecated(po::options_description *positional,
   positional->add_options()
     ("image-or-snap-or-device-spec",
      "image, snapshot, or device specification\n"
-     "[<pool-name>/]<image-name>[@<snapshot-name>] or <device-path>");
+     "[<pool-name>/]<image-name>[@<snap-name>] or <device-path>");
   at::add_pool_option(options, at::ARGUMENT_MODIFIER_NONE);
   at::add_image_option(options, at::ARGUMENT_MODIFIER_NONE);
   at::add_snap_option(options, at::ARGUMENT_MODIFIER_NONE);

@@ -1,6 +1,7 @@
 #!/bin/sh -ex
 
 POOL=testrbdggate$$
+NS=ns
 IMAGE=test
 SIZE=64
 DATA=
@@ -52,6 +53,8 @@ check_geom_gate()
 
 setup()
 {
+    local ns x
+
     if [ -e CMakeCache.txt ]; then
 	# running under cmake build dir
 
@@ -60,10 +63,7 @@ setup()
 	CEPH_BIN=${CEPH_ROOT}/bin
 
 	export LD_LIBRARY_PATH=${CEPH_ROOT}/lib:${LD_LIBRARY_PATH}
-	export PYTHONPATH=${PYTHONPATH}:${CEPH_SRC}/pybind
-	for x in ${CEPH_ROOT}/lib/cython_modules/lib* ; do
-            PYTHONPATH="${PYTHONPATH}:${x}"
-	done
+	export PYTHONPATH=${PYTHONPATH}:${CEPH_SRC}/pybind:${CEPH_ROOT}/lib/cython_modules/lib.3
 	PATH=${CEPH_BIN}:${PATH}
     fi
 
@@ -75,17 +75,25 @@ setup()
     DATA=${TEMPDIR}/data
     dd if=/dev/urandom of=${DATA} bs=1M count=${SIZE}
     ceph osd pool create ${POOL} 32
-    rbd --dest-pool ${POOL} --no-progress import ${DATA} ${IMAGE}
+
+    rbd namespace create ${POOL}/${NS}
+    for ns in '' ${NS}; do
+        rbd --dest-pool ${POOL} --dest-namespace "${ns}" --no-progress import \
+            ${DATA} ${IMAGE}
+    done
 }
 
 cleanup()
 {
+    local ns s
+
     set +e
     rm -Rf ${TEMPDIR}
     if [ -n "${DEV}" ]
     then
 	_sudo rbd-ggate unmap ${DEV}
     fi
+
     ceph osd pool delete ${POOL} ${POOL} --yes-i-really-really-mean-it
 }
 
@@ -218,6 +226,14 @@ DEV=`_sudo rbd-ggate map ${POOL}/${IMAGE}@snap`
 rbd-ggate list | grep " ${DEV} *$"
 _sudo rbd-ggate unmap "${POOL}/${IMAGE}@snap"
 rbd-ggate list | expect_false grep " ${DEV} *$"
+DEV=
+
+echo map/unmap namespace test
+rbd snap create ${POOL}/${NS}/${IMAGE}@snap
+DEV=`_sudo rbd-ggate map ${POOL}/${NS}/${IMAGE}@snap`
+rbd-ggate list | grep " ${DEV} *$"
+_sudo rbd-ggate unmap "${POOL}/${NS}/${IMAGE}@snap"
+rbd-ggate list | expect_false grep "${DEV} $"
 DEV=
 
 echo OK

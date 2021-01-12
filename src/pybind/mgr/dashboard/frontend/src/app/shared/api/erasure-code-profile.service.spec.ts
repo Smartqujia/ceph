@@ -1,7 +1,7 @@
 import { HttpClientTestingModule, HttpTestingController } from '@angular/common/http/testing';
 import { TestBed } from '@angular/core/testing';
 
-import { configureTestBed } from '../../../testing/unit-test-helper';
+import { configureTestBed } from '~/testing/unit-test-helper';
 import { ErasureCodeProfile } from '../models/erasure-code-profile';
 import { ErasureCodeProfileService } from './erasure-code-profile.service';
 
@@ -17,8 +17,8 @@ describe('ErasureCodeProfileService', () => {
   });
 
   beforeEach(() => {
-    service = TestBed.get(ErasureCodeProfileService);
-    httpTesting = TestBed.get(HttpTestingController);
+    service = TestBed.inject(ErasureCodeProfileService);
+    httpTesting = TestBed.inject(HttpTestingController);
   });
 
   afterEach(() => {
@@ -41,27 +41,15 @@ describe('ErasureCodeProfileService', () => {
     expect(req.request.method).toBe('POST');
   });
 
-  it('should call update', () => {
-    service.update(testProfile).subscribe();
-    const req = httpTesting.expectOne(`${apiPath}/test`);
-    expect(req.request.method).toBe('PUT');
-  });
-
   it('should call delete', () => {
     service.delete('test').subscribe();
     const req = httpTesting.expectOne(`${apiPath}/test`);
     expect(req.request.method).toBe('DELETE');
   });
 
-  it('should call get', () => {
-    service.get('test').subscribe();
-    const req = httpTesting.expectOne(`${apiPath}/test`);
-    expect(req.request.method).toBe('GET');
-  });
-
   it('should call getInfo', () => {
     service.getInfo().subscribe();
-    const req = httpTesting.expectOne(`${apiPath}/_info`);
+    const req = httpTesting.expectOne(`ui-${apiPath}/info`);
     expect(req.request.method).toBe('GET');
   });
 });

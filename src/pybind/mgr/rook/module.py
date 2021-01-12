@@ -1,120 +1,48 @@
+import datetime
 import threading
 import functools
 import os
-import uuid
+import json
 
-from mgr_module import MgrModule
+from ceph.deployment import inventory
+from ceph.deployment.service_spec import ServiceSpec, NFSServiceSpec, RGWSpec, PlacementSpec
 
-import orchestrator
+try:
+    from typing import List, Dict, Optional, Callable, Any
+    from ceph.deployment.drive_group import DriveGroupSpec
+except ImportError:
+    pass  # just for type checking
 
 try:
     from kubernetes import client, config
     from kubernetes.client.rest import ApiException
 
     kubernetes_imported = True
+
+    # https://github.com/kubernetes-client/python/issues/895
+    from kubernetes.client.models.v1_container_image import V1ContainerImage
+    def names(self, names):
+        self._names = names
+    V1ContainerImage.names = V1ContainerImage.names.setter(names)
+
 except ImportError:
     kubernetes_imported = False
     client = None
     config = None
 
+from mgr_module import MgrModule, Option
+import orchestrator
+
 from .rook_cluster import RookCluster
 
 
-all_completions = []
-
-
-class RookReadCompletion(orchestrator.ReadCompletion):
-    """
-    All reads are simply API calls: avoid spawning
-    huge numbers of threads by just running them
-    inline when someone calls wait()
-    """
-
-    def __init__(self, cb):
-        super(RookReadCompletion, self).__init__()
-        self.cb = cb
-        self._result = None
-        self._complete = False
-
-        self.message = "<read op>"
-
-        # XXX hacky global
-        global all_completions
-        all_completions.append(self)
-
-    @property
-    def result(self):
-        return self._result
-
-    @property
-    def is_complete(self):
-        return self._complete
-
-    def execute(self):
-        self._result = self.cb()
-        self._complete = True
-
-
-class RookWriteCompletion(orchestrator.WriteCompletion):
-    """
-    Writes are a two-phase thing, firstly sending
-    the write to the k8s API (fast) and then waiting
-    for the corresponding change to appear in the
-    Ceph cluster (slow)
-    """
-    # XXX kubernetes bindings call_api already usefully has
-    # a completion= param that uses threads.  Maybe just
-    # use that?
-    def __init__(self, execute_cb, complete_cb, message):
-        super(RookWriteCompletion, self).__init__()
-        self.execute_cb = execute_cb
-        self.complete_cb = complete_cb
-
-        # Executed means I executed my k8s API call, it may or may
-        # not have succeeded
-        self.executed = False
-
-        # Result of k8s API call, this is set if executed==True
-        self.k8s_result = None
-
-        self.effective = False
-
-        self.id = str(uuid.uuid4())
-
-        self.message = message
-
-        self.error = None
-
-        # XXX hacky global
-        global all_completions
-        all_completions.append(self)
-
-    @property
-    def is_persistent(self):
-        return (not self.is_errored) and self.executed
-
-    @property
-    def is_effective(self):
-        return self.effective
-
-    @property
-    def is_errored(self):
-        return self.error is not None
-
-    def execute(self):
-        if not self.executed:
-            self.k8s_result = self.execute_cb()
-            self.executed = True
-
-        if not self.effective:
-            # TODO: check self.result for API errors
-            if self.complete_cb is None:
-                self.effective = True
-            else:
-                self.effective = self.complete_cb()
+class RookCompletion(orchestrator.Completion):
+    def evaluate(self):
+        self.finalize(None)
 
 
 def deferred_read(f):
+    # type: (Callable) -> Callable[..., RookCompletion]
     """
     Decorator to make RookOrchestrator methods return
     a completion object that executes themselves.
@@ -122,80 +50,83 @@ def deferred_read(f):
 
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
-        return RookReadCompletion(lambda: f(*args, **kwargs))
+        return RookCompletion(on_complete=lambda _: f(*args, **kwargs))
 
     return wrapper
 
 
+def write_completion(on_complete,  # type: Callable
+                     message,  # type: str
+                     mgr,
+                     calc_percent=None  # type: Optional[Callable[[], RookCompletion]]
+                     ):
+    # type: (...) -> RookCompletion
+    return RookCompletion.with_progress(
+        message=message,
+        mgr=mgr,
+        on_complete=lambda _: on_complete(),
+        calc_percent=calc_percent,
+    )
+
+
+class RookEnv(object):
+    def __init__(self):
+        # POD_NAMESPACE already exist for Rook 0.9
+        self.namespace = os.environ.get('POD_NAMESPACE', 'rook-ceph')
+
+        # ROOK_CEPH_CLUSTER_CRD_NAME is new is Rook 1.0
+        self.cluster_name = os.environ.get('ROOK_CEPH_CLUSTER_CRD_NAME', self.namespace)
+
+        self.operator_namespace = os.environ.get('ROOK_OPERATOR_NAMESPACE', self.namespace)
+        self.crd_version = os.environ.get('ROOK_CEPH_CLUSTER_CRD_VERSION', 'v1')
+        self.api_name = "ceph.rook.io/" + self.crd_version
+
+    def api_version_match(self):
+        return self.crd_version == 'v1'
+
+    def has_namespace(self):
+        return 'POD_NAMESPACE' in os.environ
+
+
 class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
-    OPTIONS = [
+    """
+    Writes are a two-phase thing, firstly sending
+    the write to the k8s API (fast) and then waiting
+    for the corresponding change to appear in the
+    Ceph cluster (slow)
+
+    Right now, we are calling the k8s API synchronously.
+    """
+
+    MODULE_OPTIONS: List[Option] = [
         # TODO: configure k8s API addr instead of assuming local
     ]
 
-    def _progress(self, *args, **kwargs):
-        try:
-            self.remote("progress", *args, **kwargs)
-        except ImportError:
-            # If the progress module is disabled that's fine,
-            # they just won't see the output.
-            pass
+    def process(self, completions):
+        # type: (List[RookCompletion]) -> None
 
-    def wait(self, completions):
-        self.log.info("wait: completions={0}".format(completions))
+        if completions:
+            self.log.info("process: completions={0}".format(orchestrator.pretty_print(completions)))
 
-        incomplete = False
-
-        # Our `wait` implementation is very simple because everything's
-        # just an API call.
-        for c in completions:
-            if not isinstance(c, RookReadCompletion) and \
-                    not isinstance(c, RookWriteCompletion):
-                raise TypeError(
-                    "wait() requires list of completions, not {0}".format(
-                        c.__class__
-                    ))
-
-            if c.is_complete:
-                continue
-
-            if not c.is_read:
-                self._progress("update", c.id, c.message, 0.5)
-
-            try:
-                c.execute()
-            except Exception as e:
-                self.log.exception("Completion {0} threw an exception:".format(
-                    c.message
-                ))
-                c.error = e
-                c._complete = True
-                if not c.is_read:
-                    self._progress("complete", c.id)
-            else:
-                if c.is_complete:
-                    if not c.is_read:
-                        self._progress("complete", c.id)
-
-            if not c.is_complete:
-                incomplete = True
-
-        return not incomplete
+            for p in completions:
+                p.evaluate()
 
     @staticmethod
     def can_run():
-        if kubernetes_imported:
-            return True, ""
-        else:
+        if not kubernetes_imported:
             return False, "`kubernetes` python module not found"
+        if not RookEnv().api_version_match():
+            return False, "Rook version unsupported."
+        return True, ''
 
     def available(self):
         if not kubernetes_imported:
             return False, "`kubernetes` python module not found"
-        elif not self._in_cluster_name:
+        elif not self._rook_env.has_namespace():
             return False, "ceph-mgr not running in Rook cluster"
 
         try:
-            self.k8s.list_namespaced_pod(self.rook_cluster.cluster_name)
+            self.k8s.list_namespaced_pod(self._rook_env.namespace)
         except ApiException as e:
             return False, "Cannot reach Kubernetes API: {}".format(e)
         else:
@@ -205,75 +136,64 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
         super(RookOrchestrator, self).__init__(*args, **kwargs)
 
         self._initialized = threading.Event()
-        self._k8s = None
+        self._k8s_CoreV1_api = None
+        self._k8s_BatchV1_api = None
         self._rook_cluster = None
+        self._rook_env = RookEnv()
 
         self._shutdown = threading.Event()
+
+        self.all_progress_references = list()  # type: List[orchestrator.ProgressReference]
 
     def shutdown(self):
         self._shutdown.set()
 
     @property
     def k8s(self):
+        # type: () -> client.CoreV1Api
         self._initialized.wait()
-        return self._k8s
+        assert self._k8s_CoreV1_api is not None
+        return self._k8s_CoreV1_api
 
     @property
     def rook_cluster(self):
+        # type: () -> RookCluster
         self._initialized.wait()
+        assert self._rook_cluster is not None
         return self._rook_cluster
-
-    @property
-    def _in_cluster_name(self):
-        """
-        Check if we appear to be running inside a Kubernetes/Rook
-        cluster
-
-        :return: str
-        """
-        if 'POD_NAMESPACE' in os.environ:
-            return os.environ['POD_NAMESPACE']
-        if 'ROOK_CLUSTER_NAME' in os.environ:
-            return os.environ['ROOK_CLUSTER_NAME']
 
     def serve(self):
         # For deployed clusters, we should always be running inside
         # a Rook cluster.  For development convenience, also support
         # running outside (reading ~/.kube config)
 
-        if self._in_cluster_name:
+        if self._rook_env.has_namespace():
             config.load_incluster_config()
-            cluster_name = self._in_cluster_name
         else:
             self.log.warning("DEVELOPMENT ONLY: Reading kube config from ~")
             config.load_kube_config()
-
-            cluster_name = "rook"
 
             # So that I can do port forwarding from my workstation - jcsp
             from kubernetes.client import configuration
             configuration.verify_ssl = False
 
-        self._k8s = client.CoreV1Api()
+        self._k8s_CoreV1_api = client.CoreV1Api()
+        self._k8s_BatchV1_api = client.BatchV1Api()
 
         try:
             # XXX mystery hack -- I need to do an API call from
             # this context, or subsequent API usage from handle_command
             # fails with SSLError('bad handshake').  Suspect some kind of
             # thread context setup in SSL lib?
-            self._k8s.list_namespaced_pod(cluster_name)
+            self._k8s_CoreV1_api.list_namespaced_pod(self._rook_env.namespace)
         except ApiException:
             # Ignore here to make self.available() fail with a proper error message
             pass
 
         self._rook_cluster = RookCluster(
-            self._k8s,
-            cluster_name)
-
-
-        # In case Rook isn't already clued in to this ceph
-        # cluster's existence, initialize it.
-        # self._rook_cluster.init_rook()
+            self._k8s_CoreV1_api,
+            self._k8s_BatchV1_api,
+            self._rook_env)
 
         self._initialized.set()
 
@@ -282,122 +202,358 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
             # in case we had a caller that wait()'ed on them long enough
             # to get persistence but not long enough to get completion
 
-            global all_completions
-            self.wait(all_completions)
-            all_completions = [c for c in all_completions if not c.is_complete]
+            self.all_progress_references = [p for p in self.all_progress_references if not p.effective]
+            for p in self.all_progress_references:
+                p.update()
 
             self._shutdown.wait(5)
 
-        # TODO: watch Rook for config changes to complain/update if
-        # things look a bit out of sync?
+    def cancel_completions(self):
+        for p in self.all_progress_references:
+            p.fail()
+        self.all_progress_references.clear()
 
     @deferred_read
-    def get_inventory(self, node_filter=None):
-        node_list = None
-        if node_filter and node_filter.nodes:
-            # Explicit node list
-            node_list = node_filter.nodes
-        elif node_filter and node_filter.labels:
-            # TODO: query k8s API to resolve to node list, and pass
+    def get_inventory(self, host_filter=None, refresh=False):
+        host_list = None
+        if host_filter and host_filter.hosts:
+            # Explicit host list
+            host_list = host_filter.hosts
+        elif host_filter and host_filter.labels:
+            # TODO: query k8s API to resolve to host list, and pass
             # it into RookCluster.get_discovered_devices
             raise NotImplementedError()
 
-        devs = self.rook_cluster.get_discovered_devices(node_list)
+        devs = self.rook_cluster.get_discovered_devices(host_list)
 
         result = []
-        for node_name, node_devs in devs.items():
+        for host_name, host_devs in devs.items():
             devs = []
-            for d in node_devs:
-                dev = orchestrator.InventoryDevice()
+            for d in host_devs:
+                if 'cephVolumeData' in d and d['cephVolumeData']:
+                    devs.append(inventory.Device.from_json(json.loads(d['cephVolumeData'])))
+                else:
+                    devs.append(inventory.Device(
+                        path = '/dev/' + d['name'],
+                        sys_api = dict(
+                            rotational = '1' if d['rotational'] else '0',
+                            size = d['size']
+                            ),
+                        available = False,
+                        rejected_reasons=['device data coming from ceph-volume not provided'],
+                    ))
 
-                # XXX CAUTION!  https://github.com/rook/rook/issues/1716
-                # Passing this through for the sake of completeness but it
-                # is not trustworthy!
-                dev.blank = d['empty']
-                dev.type = 'hdd' if d['rotational'] else 'ssd'
-                dev.id = d['name']
-                dev.size = d['size']
-
-                if d['filesystem'] == "" and not d['rotational']:
-                    # Empty or partitioned SSD
-                    partitioned_space = sum(
-                        [p['size'] for p in d['Partitions']])
-                    dev.metadata_space_free = max(0, d[
-                        'size'] - partitioned_space)
-
-                devs.append(dev)
-
-            result.append(orchestrator.InventoryNode(node_name, devs))
+            result.append(orchestrator.InventoryHost(host_name, inventory.Devices(devs)))
 
         return result
 
     @deferred_read
-    def describe_service(self, service_type, service_id, nodename):
+    def get_hosts(self):
+        # type: () -> List[orchestrator.HostSpec]
+        return [orchestrator.HostSpec(n) for n in self.rook_cluster.get_node_names()]
 
-        assert service_type in ("mds", "osd", "mgr", "mon", None), service_type + " unsupported"
+    @deferred_read
+    def describe_service(self, service_type=None, service_name=None,
+                         refresh=False):
+        now = datetime.datetime.utcnow()
 
-        pods = self.rook_cluster.describe_pods(service_type, service_id, nodename)
+        # CephCluster
+        cl = self.rook_cluster.rook_api_get(
+            "cephclusters/{0}".format(self.rook_cluster.rook_env.cluster_name))
+        self.log.debug('CephCluster %s' % cl)
+        image_name = cl['spec'].get('cephVersion', {}).get('image', None)
+        num_nodes = len(self.rook_cluster.get_node_names())
 
+        spec = {}
+        if service_type == 'mon' or service_type is None:
+            spec['mon'] = orchestrator.ServiceDescription(
+                    spec=ServiceSpec(
+                        'mon',
+                        placement=PlacementSpec(
+                            count=cl['spec'].get('mon', {}).get('count', 1),
+                            ),
+                        ),
+                    size=cl['spec'].get('mon', {}).get('count', 1),
+                    container_image_name=image_name,
+                    last_refresh=now,
+                    )
+        if service_type == 'mgr' or service_type is None:
+            spec['mgr'] = orchestrator.ServiceDescription(
+                    spec=ServiceSpec(
+                        'mgr',
+                        placement=PlacementSpec.from_string('count:1'),
+                        ),
+                    size=1,
+                    container_image_name=image_name,
+                    last_refresh=now,
+                    )
+        if not cl['spec'].get('crashCollector', {}).get('disable', False):
+            spec['crash'] = orchestrator.ServiceDescription(
+                spec=ServiceSpec(
+                    'crash',
+                    placement=PlacementSpec.from_string('*'),
+                ),
+                size=num_nodes,
+                container_image_name=image_name,
+                last_refresh=now,
+            )
+
+        if service_type == 'mds' or service_type is None:
+            # CephFilesystems
+            all_fs = self.rook_cluster.rook_api_get(
+                    "cephfilesystems/")
+            self.log.debug('CephFilesystems %s' % all_fs)
+            for fs in all_fs.get('items', []):
+                svc = 'mds.' + fs['metadata']['name']
+                if svc in spec:
+                    continue
+                # FIXME: we are conflating active (+ standby) with count
+                active = fs['spec'].get('metadataServer', {}).get('activeCount', 1)
+                total_mds = active
+                if fs['spec'].get('metadataServer', {}).get('activeStandby', False):
+                    total_mds = active * 2
+                    spec[svc] = orchestrator.ServiceDescription(
+                            spec=ServiceSpec(
+                                service_type='mds',
+                                service_id=fs['metadata']['name'],
+                                placement=PlacementSpec(count=active),
+                                ),
+                            size=total_mds,
+                            container_image_name=image_name,
+                            last_refresh=now,
+                            )
+
+        if service_type == 'rgw' or service_type is None:
+            # CephObjectstores
+            all_zones = self.rook_cluster.rook_api_get(
+                    "cephobjectstores/")
+            self.log.debug('CephObjectstores %s' % all_zones)
+            for zone in all_zones.get('items', []):
+                rgw_realm = zone['metadata']['name']
+                rgw_zone = rgw_realm
+                svc = 'rgw.' + rgw_realm + '.' + rgw_zone
+                if svc in spec:
+                    continue
+                active = zone['spec']['gateway']['instances'];
+                if 'securePort' in zone['spec']['gateway']:
+                    ssl = True
+                    port = zone['spec']['gateway']['securePort']
+                else:
+                    ssl = False
+                    port = zone['spec']['gateway']['port'] or 80
+                spec[svc] = orchestrator.ServiceDescription(
+                        spec=RGWSpec(
+                            service_id=rgw_realm + '.' + rgw_zone,
+                            rgw_realm=rgw_realm,
+                            rgw_zone=rgw_zone,
+                            ssl=ssl,
+                            rgw_frontend_port=port,
+                            placement=PlacementSpec(count=active),
+                            ),
+                        size=active,
+                        container_image_name=image_name,
+                        last_refresh=now,
+                        )
+
+        if service_type == 'nfs' or service_type is None:
+            # CephNFSes
+            all_nfs = self.rook_cluster.rook_api_get(
+                    "cephnfses/")
+            self.log.warning('CephNFS %s' % all_nfs)
+            for nfs in all_nfs.get('items', []):
+                nfs_name = nfs['metadata']['name']
+                svc = 'nfs.' + nfs_name
+                if svc in spec:
+                    continue
+                active = nfs['spec'].get('server', {}).get('active')
+                spec[svc] = orchestrator.ServiceDescription(
+                        spec=NFSServiceSpec(
+                            service_id=nfs_name,
+                            pool=nfs['spec']['rados']['pool'],
+                            namespace=nfs['spec']['rados'].get('namespace', None),
+                            placement=PlacementSpec(count=active),
+                            ),
+                        size=active,
+                        last_refresh=now,
+                        )
+
+        for dd in self._list_daemons():
+            if dd.service_name() not in spec:
+                continue
+            service = spec[dd.service_name()]
+            service.running += 1
+            if not service.container_image_id:
+                service.container_image_id = dd.container_image_id
+            if not service.container_image_name:
+                service.container_image_name = dd.container_image_name
+            if not service.last_refresh or not dd.last_refresh or dd.last_refresh < service.last_refresh:
+                service.last_refresh = dd.last_refresh
+            if not service.created or dd.created < service.created:
+                service.created = dd.created
+
+        return [v for k, v in spec.items()]
+
+    @deferred_read
+    def list_daemons(self, service_name=None, daemon_type=None, daemon_id=None, host=None,
+                     refresh=False):
+        return self._list_daemons(service_name=service_name,
+                                  daemon_type=daemon_type,
+                                  daemon_id=daemon_id,
+                                  host=host,
+                                  refresh=refresh)
+
+    def _list_daemons(self, service_name=None, daemon_type=None, daemon_id=None, host=None,
+                      refresh=False):
+        pods = self.rook_cluster.describe_pods(daemon_type, daemon_id, host)
+        self.log.debug('pods %s' % pods)
         result = []
         for p in pods:
-            sd = orchestrator.ServiceDescription()
-            sd.nodename = p['nodename']
-            sd.container_id = p['name']
-            sd.service_type = p['labels']['app'].replace('rook-ceph-', '')
+            sd = orchestrator.DaemonDescription()
+            sd.hostname = p['hostname']
+            sd.daemon_type = p['labels']['app'].replace('rook-ceph-', '')
+            status = {
+                'Pending': -1,
+                'Running': 1,
+                'Succeeded': 0,
+                'Failed': -1,
+                'Unknown': -1,
+            }[p['phase']]
+            sd.status = status
+            sd.status_desc = p['phase']
 
-            if sd.service_type == "osd":
-                sd.daemon_name = "%s" % p['labels']["ceph-osd-id"]
-            elif sd.service_type == "mds":
-                sd.daemon_name = p['labels']["rook_file_system"]
-            elif sd.service_type == "mon":
-                sd.daemon_name = p['labels']["mon"]
-            elif sd.service_type == "mgr":
-                sd.daemon_name = p['labels']["mgr"]
+            if 'ceph_daemon_id' in p['labels']:
+                sd.daemon_id = p['labels']['ceph_daemon_id']
+            elif 'ceph-osd-id' in p['labels']:
+                sd.daemon_id = p['labels']['ceph-osd-id']
             else:
                 # Unknown type -- skip it
                 continue
 
+            if service_name is not None and service_name != sd.service_name():
+                continue
+            sd.container_image_name = p['container_image_name']
+            sd.container_image_id = p['container_image_id']
+            sd.created = p['created']
+            sd.last_configured = p['created']
+            sd.last_deployed = p['created']
+            sd.started = p['started']
+            sd.last_refresh = p['refreshed']
             result.append(sd)
 
         return result
 
-    def add_stateless_service(self, service_type, spec):
-        # assert isinstance(spec, orchestrator.StatelessServiceSpec)
+    def _service_add_decorate(self, typename, spec, func):
+        return write_completion(
+            on_complete=lambda : func(spec),
+            message="Creating {} services for {}".format(typename, spec.service_id),
+            mgr=self
+        )
 
-        if service_type == "mds":
-            return RookWriteCompletion(
-                lambda: self.rook_cluster.add_filesystem(spec), None,
-                "Creating Filesystem services for {0}".format(spec.name))
-        elif service_type == "rgw" :
-            return RookWriteCompletion(
-                lambda: self.rook_cluster.add_objectstore(spec), None,
-                "Creating RGW services for {0}".format(spec.name))
-        else:
-            # TODO: RGW, NFS
-            raise NotImplementedError(service_type)
+    def _service_rm_decorate(self, typename, name, func):
+        return write_completion(
+            on_complete=lambda : func(),
+            message="Removing {} services for {}".format(typename, name),
+            mgr=self
+        )
 
-    def create_osds(self, spec):
-        # Validate spec.node
-        if not self.rook_cluster.node_exists(spec.node):
-            raise RuntimeError("Node '{0}' is not in the Kubernetes "
-                               "cluster".format(spec.node))
+    def remove_service(self, service_name):
+        service_type, service_name = service_name.split('.', 1)
+        if service_type == 'mds':
+            return self._service_rm_decorate(
+                'MDS', service_name, lambda: self.rook_cluster.rm_service(
+                    'cephfilesystems', service_name)
+            )
+        elif service_type == 'rgw':
+            return self._service_rm_decorate(
+                'RGW', service_name, lambda: self.rook_cluster.rm_service('cephobjectstores', service_name)
+            )
+        elif service_type == 'nfs':
+            return self._service_rm_decorate(
+                'NFS', service_name, lambda: self.rook_cluster.rm_service('cephnfses', service_name)
+            )
 
-        # Validate whether cluster CRD can accept individual OSD
-        # creations (i.e. not useAllDevices)
-        if not self.rook_cluster.can_create_osd():
-            raise RuntimeError("Rook cluster configuration does not "
-                               "support OSD creation.")
+    def apply_mon(self, spec):
+        # type: (ServiceSpec) -> RookCompletion
+        if spec.placement.hosts or spec.placement.label:
+            raise RuntimeError("Host list or label is not supported by rook.")
 
-        def execute():
-            self.rook_cluster.add_osds(spec)
+        return write_completion(
+            lambda: self.rook_cluster.update_mon_count(spec.placement.count),
+            "Updating mon count to {0}".format(spec.placement.count),
+            mgr=self
+        )
 
-        def is_complete():
+    def apply_mds(self, spec):
+        # type: (ServiceSpec) -> RookCompletion
+        return self._service_add_decorate('MDS', spec,
+                                          self.rook_cluster.apply_filesystem)
+
+    def apply_rgw(self, spec):
+        # type: (RGWSpec) -> RookCompletion
+        return self._service_add_decorate('RGW', spec,
+                                          self.rook_cluster.apply_objectstore)
+
+    def apply_nfs(self, spec):
+        # type: (NFSServiceSpec) -> RookCompletion
+        return self._service_add_decorate("NFS", spec,
+                                          self.rook_cluster.apply_nfsgw)
+
+    def remove_daemons(self, names):
+        return write_completion(
+            lambda: self.rook_cluster.remove_pods(names),
+            "Removing daemons {}".format(','.join(names)),
+            mgr=self
+        )
+
+    def create_osds(self, drive_group):
+        # type: (DriveGroupSpec) -> RookCompletion
+        """ Creates OSDs from a drive group specification.
+
+        $: ceph orch osd create -i <dg.file>
+
+        The drivegroup file must only contain one spec at a time.
+        """
+
+        targets = []  # type: List[str]
+        if drive_group.data_devices and drive_group.data_devices.paths:
+            targets += [d.path for d in drive_group.data_devices.paths]
+        if drive_group.data_directories:
+            targets += drive_group.data_directories
+
+        def execute(all_hosts_):
+            # type: (List[orchestrator.HostSpec]) -> orchestrator.Completion
+            matching_hosts = drive_group.placement.filter_matching_hosts(lambda label=None, as_hostspec=None: all_hosts_)
+
+            assert len(matching_hosts) == 1
+
+            if not self.rook_cluster.node_exists(matching_hosts[0]):
+                raise RuntimeError("Node '{0}' is not in the Kubernetes "
+                                   "cluster".format(matching_hosts))
+
+            # Validate whether cluster CRD can accept individual OSD
+            # creations (i.e. not useAllDevices)
+            if not self.rook_cluster.can_create_osd():
+                raise RuntimeError("Rook cluster configuration does not "
+                                   "support OSD creation.")
+
+            return orchestrator.Completion.with_progress(
+                message="Creating OSD on {0}:{1}".format(
+                        matching_hosts,
+                        targets),
+                mgr=self,
+                on_complete=lambda _:self.rook_cluster.add_osds(drive_group, matching_hosts),
+                calc_percent=lambda: has_osds(matching_hosts)
+            )
+
+        @deferred_read
+        def has_osds(matching_hosts):
+
             # Find OSD pods on this host
             pod_osd_ids = set()
-            pods = self._k8s.list_namespaced_pod("rook-ceph",
-                                                 label_selector="rook_cluster=rook-ceph,app=rook-ceph-osd",
+            pods = self.k8s.list_namespaced_pod(self._rook_env.namespace,
+                                                 label_selector="rook_cluster={},app=rook-ceph-osd".format(self._rook_env.cluster_name),
                                                  field_selector="spec.nodeName={0}".format(
-                                                     spec.node
+                                                     matching_hosts[0]
                                                  )).items
             for p in pods:
                 pod_osd_ids.add(int(p.metadata.labels['ceph-osd-id']))
@@ -412,7 +568,7 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
                     continue
 
                 metadata = self.get_metadata('osd', "%s" % osd_id)
-                if metadata and metadata['devices'] in spec.drive_group.devices:
+                if metadata and metadata['devices'] in targets:
                     found.append(osd_id)
                 else:
                     self.log.info("ignoring osd {0} {1}".format(
@@ -421,8 +577,14 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
 
             return found is not None
 
-        return RookWriteCompletion(execute, is_complete,
-                                   "Creating OSD on {0}:{1}".format(
-                                       spec.node,
-                                       spec.drive_group.devices
-                                   ))
+        c = self.get_hosts().then(execute)
+        return c
+
+    def blink_device_light(self, ident_fault: str, on: bool, locs: List[orchestrator.DeviceLightLoc]) -> RookCompletion:
+        return write_completion(
+            on_complete=lambda: self.rook_cluster.blink_light(
+                ident_fault, on, locs),
+            message="Switching <{}> identification light in {}".format(
+                on, ",".join(["{}:{}".format(loc.host, loc.dev) for loc in locs])),
+            mgr=self
+        )

@@ -7,6 +7,21 @@ VAGRANTFILE_API_VERSION = '2'
 
 DEBUG = false
 
+global_settings = {}
+if File.symlink?(__FILE__)
+  global_config =  File.expand_path(
+    File.join(
+      File.dirname(File.readlink(__FILE__)),
+      'global_vagrant_variables.yml')
+  )
+  if File.exist?(global_config)
+    global_settings = YAML.load_file(global_config)
+  end
+end
+
+LIBVIRT_URI = global_settings.fetch('libvirt_uri', '')
+LIBVIRT_STORAGE_POOL = global_settings.fetch('libvirt_storage_pool', '')
+
 config_file=File.expand_path(File.join(File.dirname(__FILE__), 'vagrant_variables.yml'))
 settings=YAML.load_file(config_file)
 
@@ -25,7 +40,7 @@ CLUSTER_SUBNET = settings['cluster_subnet']
 BOX            = settings['vagrant_box']
 CLIENT_BOX     = settings['client_vagrant_box']
 BOX_URL        = settings['vagrant_box_url']
-SYNC_DIR       = settings['vagrant_sync_dir']
+SYNC_DIR       = settings.fetch('vagrant_sync_dir', '/vagrant')
 MEMORY         = settings['memory']
 ETH            = settings['eth']
 USER           = settings['ssh_username']
@@ -46,19 +61,17 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
   config.ssh.private_key_path = settings['ssh_private_key_path']
   config.ssh.username = USER
 
-  # When using libvirt, avoid errors like:
-  # "CPU feature cmt not found"
   config.vm.provider :libvirt do |lv|
+    # When using libvirt, avoid errors like:
+    # "CPU feature cmt not found"
     lv.cpu_mode = 'host-passthrough'
-  end
-
-  # Faster bootup. Disables mounting the sync folder for libvirt and virtualbox
-  if DISABLE_SYNCED_FOLDER
-    config.vm.provider :virtualbox do |v,override|
-      override.vm.synced_folder '.', SYNC_DIR, disabled: true
+    # set libvirt uri if present
+    if not LIBVIRT_URI.empty?
+      lv.uri = LIBVIRT_URI
     end
-    config.vm.provider :libvirt do |v,override|
-      override.vm.synced_folder '.', SYNC_DIR, disabled: true
+    # set libvirt storage pool if present
+    if not LIBVIRT_STORAGE_POOL.empty?
+      lv.storage_pool_name = LIBVIRT_STORAGE_POOL
     end
   end
 
@@ -350,7 +363,7 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
         (0..2).each do |d|
           vb.customize ['createhd',
                         '--filename', "disk-#{i}-#{d}",
-                        '--size', '11000'] unless File.exist?("disk-#{i}-#{d}.vdi")
+                        '--size', '12000'] unless File.exist?("disk-#{i}-#{d}.vdi")
           vb.customize ['storageattach', :id,
                         '--storagectl', 'OSD Controller',
                         '--port', 3 + d,
@@ -372,12 +385,12 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
       end
 
       # Libvirt
-      driverletters = ('a'..'z').to_a
+      driverletters = ('b'..'z').to_a
       osd.vm.provider :libvirt do |lv|
         # always make /dev/sd{a/b/c/d} so that CI can ensure that
         # virtualbox and libvirt will have the same devices to use for OSDs
         (0..3).each do |d|
-          lv.storage :file, :device => "hd#{driverletters[d]}", :path => "disk-#{i}-#{d}-#{DISK_UUID}.disk", :size => '12G', :bus => "ide"
+          lv.storage :file, :device => "sd#{driverletters[d]}", :size => '12G'
         end
         lv.memory = MEMORY
         lv.random_hostname = true
@@ -403,4 +416,8 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
 
     end
   end
+
+  # Faster bootup. Disables mounting the sync folder for libvirt and virtualbox
+  config.vm.synced_folder './', SYNC_DIR, disabled: DISABLE_SYNCED_FOLDER
+
 end

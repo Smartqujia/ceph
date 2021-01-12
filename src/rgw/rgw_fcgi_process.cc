@@ -1,11 +1,10 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// vim: ts=8 sw=2 smarttab ft=cpp
 
 #include "common/errno.h"
 #include "common/Throttle.h"
 #include "common/WorkQueue.h"
 
-#include "rgw_rados.h"
 #include "rgw_rest.h"
 #include "rgw_frontend.h"
 #include "rgw_request.h"
@@ -89,7 +88,7 @@ void RGWFCGXProcess::run()
   }
 
   for (;;) {
-    RGWFCGXRequest* req = new RGWFCGXRequest(store->get_new_req_id(), &qr);
+    RGWFCGXRequest* req = new RGWFCGXRequest(store->getRados()->get_new_req_id(), &qr);
     dout(10) << "allocated request req=" << hex << req << dec << dendl;
     req_throttle.get(1);
     int ret = FCGX_Accept_r(req->fcgx);
@@ -125,7 +124,8 @@ void RGWFCGXProcess::handle_request(RGWRequest* r)
 
  
   int ret = process_request(store, rest, req, uri_prefix,
-                            *auth_registry, &client_io, olog);
+                            *auth_registry, &client_io, olog,
+                            null_yield, nullptr);
   if (ret < 0) {
     /* we don't really care about return code */
     dout(20) << "process_request() returned " << ret << dendl;

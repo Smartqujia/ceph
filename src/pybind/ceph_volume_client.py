@@ -1,7 +1,7 @@
 """
 Copyright (C) 2015 Red Hat, Inc.
 
-LGPL2.1.  See file COPYING.
+LGPL-2.1 or LGPL-3.0.  See file COPYING.
 """
 
 from contextlib import contextmanager
@@ -27,9 +27,11 @@ def to_bytes(param):
     Helper method that returns byte representation of the given parameter.
     '''
     if isinstance(param, str):
-        return param.encode()
+        return param.encode('utf-8')
+    elif param is None:
+        return param
     else:
-        return str(param).encode()
+        return str(param).encode('utf-8')
 
 class RadosError(Exception):
     """
@@ -213,6 +215,7 @@ CEPHFSVOLUMECLIENT_VERSION_HISTORY = """
     * 2 - Added get_object, put_object, delete_object methods to CephFSVolumeClient
     * 3 - Allow volumes to be created without RADOS namespace isolation
     * 4 - Added get_object_and_version, put_object_versioned method to CephFSVolumeClient
+    * 5 - Disallow authorize API for users not created by CephFSVolumeClient
 """
 
 
@@ -236,20 +239,38 @@ class CephFSVolumeClient(object):
     """
 
     # Current version
-    version = 4
+    version = 5
 
     # Where shall we create our volumes?
     POOL_PREFIX = "fsvolume_"
     DEFAULT_VOL_PREFIX = "/volumes"
     DEFAULT_NS_PREFIX = "fsvolumens_"
 
-    def __init__(self, auth_id, conf_path, cluster_name, volume_prefix=None, pool_ns_prefix=None):
+    def __init__(self, auth_id=None, conf_path=None, cluster_name=None,
+                 volume_prefix=None, pool_ns_prefix=None, rados=None,
+                 fs_name=None):
+        """
+        Either set all three of ``auth_id``, ``conf_path`` and
+        ``cluster_name`` (rados constructed on connect), or
+        set ``rados`` (existing rados instance).
+        """
         self.fs = None
-        self.rados = None
+        self.fs_name = fs_name
         self.connected = False
+
         self.conf_path = conf_path
         self.cluster_name = cluster_name
         self.auth_id = auth_id
+
+        self.rados = rados
+        if self.rados:
+            # Using an externally owned rados, so we won't tear it down
+            # on disconnect
+            self.own_rados = False
+        else:
+            # self.rados will be constructed in connect
+            self.own_rados = True
+
         self.volume_prefix = volume_prefix if volume_prefix else self.DEFAULT_VOL_PREFIX
         self.pool_ns_prefix = pool_ns_prefix if pool_ns_prefix else self.DEFAULT_NS_PREFIX
         # For flock'ing in cephfs, I want a unique ID to distinguish me
@@ -288,7 +309,7 @@ class CephFSVolumeClient(object):
             # Identify auth IDs from auth meta filenames. The auth meta files
             # are named as, "$<auth_id><meta filename extension>"
             regex = "^\$(.*){0}$".format(re.escape(META_FILE_EXT))
-            match = re.search(regex, d.d_name)
+            match = re.search(regex, d.d_name.decode(encoding='utf-8'))
             if match:
                 auth_ids.append(match.group(1))
 
@@ -335,7 +356,7 @@ class CephFSVolumeClient(object):
                 continue
 
             (group_id, volume_id) = volume.split('/')
-            group_id = group_id if group_id is not 'None' else None
+            group_id = group_id if group_id != 'None' else None
             volume_path = VolumePath(group_id, volume_id)
             access_level = volume_data['access_level']
 
@@ -358,8 +379,19 @@ class CephFSVolumeClient(object):
                 if vol_meta['auths'][auth_id] == want_auth:
                     continue
 
-                readonly = True if access_level is 'r' else False
-                self._authorize_volume(volume_path, auth_id, readonly)
+                readonly = access_level == 'r'
+                client_entity = "client.{0}".format(auth_id)
+                try:
+                    existing_caps = self._rados_command(
+                        'auth get',
+                        {
+                            'entity': client_entity
+                        }
+                    )
+                    # FIXME: rados raising Error instead of ObjectNotFound in auth get failure
+                except rados.Error:
+                    existing_caps = None
+                self._authorize_volume(volume_path, auth_id, readonly, existing_caps)
 
             # Recovered from partial auth updates for the auth ID's access
             # to a volume.
@@ -448,25 +480,7 @@ class CephFSVolumeClient(object):
             group_id
         )
 
-    def connect(self, premount_evict = None):
-        """
-
-        :param premount_evict: Optional auth_id to evict before mounting the filesystem: callers
-                               may want to use this to specify their own auth ID if they expect
-                               to be a unique instance and don't want to wait for caps to time
-                               out after failure of another instance of themselves.
-        """
-        log.debug("Connecting to RADOS with config {0}...".format(self.conf_path))
-        self.rados = rados.Rados(
-            name="client.{0}".format(self.auth_id),
-            clustername=self.cluster_name,
-            conffile=self.conf_path,
-            conf={}
-        )
-        self.rados.connect()
-
-        log.debug("Connection to RADOS complete")
-
+    def _connect(self, premount_evict):
         log.debug("Connecting to cephfs...")
         self.fs = cephfs.LibCephFS(rados_inst=self.rados)
         log.debug("CephFS initializing...")
@@ -476,12 +490,34 @@ class CephFSVolumeClient(object):
             self.evict(premount_evict)
             log.debug("Premount eviction of {0} completes".format(premount_evict))
         log.debug("CephFS mounting...")
-        self.fs.mount()
+        self.fs.mount(filesystem_name=to_bytes(self.fs_name))
         log.debug("Connection to cephfs complete")
 
         # Recover from partial auth updates due to a previous
         # crash.
         self.recover()
+
+    def connect(self, premount_evict = None):
+        """
+
+        :param premount_evict: Optional auth_id to evict before mounting the filesystem: callers
+                               may want to use this to specify their own auth ID if they expect
+                               to be a unique instance and don't want to wait for caps to time
+                               out after failure of another instance of themselves.
+        """
+        if self.own_rados:
+            log.debug("Configuring to RADOS with config {0}...".format(self.conf_path))
+            self.rados = rados.Rados(
+                name="client.{0}".format(self.auth_id),
+                clustername=self.cluster_name,
+                conffile=self.conf_path,
+                conf={}
+            )
+            if self.rados.state != "connected":
+                log.debug("Connecting to RADOS...")
+                self.rados.connect()
+                log.debug("Connection to RADOS complete")
+        self._connect(premount_evict)
 
     def get_mon_addrs(self):
         log.info("get_mon_addrs")
@@ -501,11 +537,18 @@ class CephFSVolumeClient(object):
             self.fs = None
             log.debug("Disconnecting cephfs complete")
 
-        if self.rados:
+        if self.rados and self.own_rados:
             log.debug("Disconnecting rados...")
             self.rados.shutdown()
             self.rados = None
             log.debug("Disconnecting rados complete")
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.disconnect()
 
     def __del__(self):
         self.disconnect()
@@ -532,31 +575,10 @@ class CephFSVolumeClient(object):
             log.info("Pool {0} already exists".format(pool_name))
             return existing_id
 
-        osd_count = len(osd_map['osds'])
-
-        # We can't query the actual cluster config remotely, but since this is
-        # just a heuristic we'll assume that the ceph.conf we have locally reflects
-        # that in use in the rest of the cluster.
-        pg_warn_max_per_osd = int(self.rados.conf_get('mon_max_pg_per_osd'))
-
-        other_pgs = 0
-        for pool in osd_map['pools']:
-            if not pool['pool_name'].startswith(self.POOL_PREFIX):
-                other_pgs += pool['pg_num']
-
-        # A basic heuristic for picking pg_num: work out the max number of
-        # PGs we can have without tripping a warning, then subtract the number
-        # of PGs already created by non-manila pools, then divide by ten.  That'll
-        # give you a reasonable result on a system where you have "a few" manila
-        # shares.
-        pg_num = ((pg_warn_max_per_osd * osd_count) - other_pgs) // 10
-        # TODO Alternatively, respect an override set by the user.
-
         self._rados_command(
             'osd pool create',
             {
                 'pool': pool_name,
-                'pg_num': int(pg_num),
             }
         )
 
@@ -573,14 +595,14 @@ class CephFSVolumeClient(object):
         else:
             return pool_id
 
-    def create_group(self, group_id):
+    def create_group(self, group_id, mode=0o755):
         # Prevent craftily-named volume groups from colliding with the meta
         # files.
         if group_id.endswith(META_FILE_EXT):
             raise ValueError("group ID cannot end with '{0}'.".format(
                 META_FILE_EXT))
         path = self._get_group_path(group_id)
-        self._mkdir_p(path)
+        self._mkdir_p(path, mode)
 
     def destroy_group(self, group_id):
         path = self._get_group_path(group_id)
@@ -591,7 +613,7 @@ class CephFSVolumeClient(object):
         else:
             self.fs.rmdir(path)
 
-    def _mkdir_p(self, path):
+    def _mkdir_p(self, path, mode=0o755):
         try:
             self.fs.stat(path)
         except cephfs.ObjectNotFound:
@@ -606,9 +628,10 @@ class CephFSVolumeClient(object):
             try:
                 self.fs.stat(subpath)
             except cephfs.ObjectNotFound:
-                self.fs.mkdir(subpath, 0o755)
+                self.fs.mkdir(subpath, mode)
 
-    def create_volume(self, volume_path, size=None, data_isolated=False, namespace_isolated=True):
+    def create_volume(self, volume_path, size=None, data_isolated=False, namespace_isolated=True,
+                      mode=0o755):
         """
         Set up metadata, pools and auth for a volume.
 
@@ -624,7 +647,7 @@ class CephFSVolumeClient(object):
         path = self._get_path(volume_path)
         log.info("create_volume: {0}".format(path))
 
-        self._mkdir_p(path)
+        self._mkdir_p(path, mode)
 
         if size is not None:
             self.fs.setxattr(path, 'ceph.quota.max_bytes', to_bytes(size), 0)
@@ -724,11 +747,12 @@ class CephFSVolumeClient(object):
             dir_handle = self.fs.opendir(root_path)
             d = self.fs.readdir(dir_handle)
             while d:
-                if d.d_name not in [".", ".."]:
+                d_name = d.d_name.decode(encoding='utf-8')
+                if d_name not in [".", ".."]:
                     # Do not use os.path.join because it is sensitive
                     # to string encoding, we just pass through dnames
                     # as byte arrays
-                    d_full = "{0}/{1}".format(root_path, d.d_name)
+                    d_full = u"{0}/{1}".format(root_path, d_name)
                     if d.is_dir():
                         rmtree(d_full)
                     else:
@@ -928,7 +952,27 @@ class CephFSVolumeClient(object):
         data['version'] = self.version
         return self._metadata_set(self._volume_metadata_path(volume_path), data)
 
-    def authorize(self, volume_path, auth_id, readonly=False, tenant_id=None):
+    def _prepare_updated_caps_list(self, existing_caps, mds_cap_str, osd_cap_str, authorize=True):
+        caps_list = []
+        for k, v in existing_caps['caps'].items():
+            if k == 'mds' or k == 'osd':
+                continue
+            elif k == 'mon':
+                if not authorize and v == 'allow r':
+                    continue
+            caps_list.extend((k,v))
+
+        if mds_cap_str:
+            caps_list.extend(('mds', mds_cap_str))
+        if osd_cap_str:
+            caps_list.extend(('osd', osd_cap_str))
+
+        if authorize and 'mon' not in caps_list:
+            caps_list.extend(('mon', 'allow r'))
+
+        return caps_list
+
+    def authorize(self, volume_path, auth_id, readonly=False, tenant_id=None, allow_existing_id=False):
         """
         Get-or-create a Ceph auth identity for `auth_id` and grant them access
         to
@@ -938,10 +982,24 @@ class CephFSVolumeClient(object):
         :param tenant_id: Optionally provide a stringizable object to
                           restrict any created cephx IDs to other callers
                           passing the same tenant ID.
+        :allow_existing_id: Optionally authorize existing auth-ids not
+                            created by ceph_volume_client
         :return:
         """
 
         with self._auth_lock(auth_id):
+            client_entity = "client.{0}".format(auth_id)
+            try:
+                existing_caps = self._rados_command(
+                    'auth get',
+                    {
+                        'entity': client_entity
+                    }
+                )
+                # FIXME: rados raising Error instead of ObjectNotFound in auth get failure
+            except rados.Error:
+                existing_caps = None
+
             # Existing meta, or None, to be updated
             auth_meta = self._auth_metadata_get(auth_id)
 
@@ -955,7 +1013,14 @@ class CephFSVolumeClient(object):
                     'dirty': True,
                 }
             }
+
             if auth_meta is None:
+                if not allow_existing_id and existing_caps is not None:
+                    msg = "auth ID: {0} exists and not created by ceph_volume_client. Not allowed to modify".format(auth_id)
+                    log.error(msg)
+                    raise CephFSVolumeClientError(msg)
+
+                # non-existent auth IDs
                 sys.stderr.write("Creating meta for ID {0} with tenant {1}\n".format(
                     auth_id, tenant_id
                 ))
@@ -965,14 +1030,6 @@ class CephFSVolumeClient(object):
                     'tenant_id': tenant_id.__str__() if tenant_id else None,
                     'volumes': volume
                 }
-
-                # Note: this is *not* guaranteeing that the key doesn't already
-                # exist in Ceph: we are allowing VolumeClient tenants to
-                # 'claim' existing Ceph keys.  In order to prevent VolumeClient
-                # tenants from reading e.g. client.admin keys, you need to
-                # have configured your VolumeClient user (e.g. Manila) to
-                # have mon auth caps that prevent it from accessing those keys
-                # (e.g. limit it to only access keys with a manila.* prefix)
             else:
                 # Disallow tenants to share auth IDs
                 if auth_meta['tenant_id'].__str__() != tenant_id.__str__():
@@ -992,7 +1049,7 @@ class CephFSVolumeClient(object):
             self._auth_metadata_set(auth_id, auth_meta)
 
             with self._volume_lock(volume_path):
-                key = self._authorize_volume(volume_path, auth_id, readonly)
+                key = self._authorize_volume(volume_path, auth_id, readonly, existing_caps)
 
             auth_meta['dirty'] = False
             auth_meta['volumes'][volume_path_str]['dirty'] = False
@@ -1009,7 +1066,7 @@ class CephFSVolumeClient(object):
                     'auth_key': None
                 }
 
-    def _authorize_volume(self, volume_path, auth_id, readonly):
+    def _authorize_volume(self, volume_path, auth_id, readonly, existing_caps):
         vol_meta = self._volume_metadata_get(volume_path)
 
         access_level = 'r' if readonly else 'rw'
@@ -1028,14 +1085,14 @@ class CephFSVolumeClient(object):
             vol_meta['auths'].update(auth)
             self._volume_metadata_set(volume_path, vol_meta)
 
-        key = self._authorize_ceph(volume_path, auth_id, readonly)
+        key = self._authorize_ceph(volume_path, auth_id, readonly, existing_caps)
 
         vol_meta['auths'][auth_id]['dirty'] = False
         self._volume_metadata_set(volume_path, vol_meta)
 
         return key
 
-    def _authorize_ceph(self, volume_path, auth_id, readonly):
+    def _authorize_ceph(self, volume_path, auth_id, readonly, existing_caps):
         path = self._get_path(volume_path)
         log.debug("Authorizing Ceph id '{0}' for path '{1}'".format(
             auth_id, path
@@ -1063,15 +1120,7 @@ class CephFSVolumeClient(object):
             want_osd_cap = 'allow {0} pool={1}'.format(want_access_level,
                                                        pool_name)
 
-        try:
-            existing = self._rados_command(
-                'auth get',
-                {
-                    'entity': client_entity
-                }
-            )
-            # FIXME: rados raising Error instead of ObjectNotFound in auth get failure
-        except rados.Error:
+        if existing_caps is None:
             caps = self._rados_command(
                 'auth get-or-create',
                 {
@@ -1083,11 +1132,11 @@ class CephFSVolumeClient(object):
                 })
         else:
             # entity exists, update it
-            cap = existing[0]
+            cap = existing_caps[0]
 
             # Construct auth caps that if present might conflict with the desired
             # auth caps.
-            unwanted_access_level = 'r' if want_access_level is 'rw' else 'rw'
+            unwanted_access_level = 'r' if want_access_level == 'rw' else 'rw'
             unwanted_mds_cap = 'allow {0} path={1}'.format(unwanted_access_level, path)
             if namespace:
                 unwanted_osd_cap = 'allow {0} pool={1} namespace={2}'.format(
@@ -1103,8 +1152,8 @@ class CephFSVolumeClient(object):
                 if not orig_mds_caps:
                     return want_mds_cap, want_osd_cap
 
-                mds_cap_tokens = orig_mds_caps.split(",")
-                osd_cap_tokens = orig_osd_caps.split(",")
+                mds_cap_tokens = [x.strip() for x in orig_mds_caps.split(",")]
+                osd_cap_tokens = [x.strip() for x in orig_osd_caps.split(",")]
 
                 if want_mds_cap in mds_cap_tokens:
                     return orig_mds_caps, orig_osd_caps
@@ -1125,15 +1174,14 @@ class CephFSVolumeClient(object):
                 orig_mds_caps, orig_osd_caps, want_mds_cap, want_osd_cap,
                 unwanted_mds_cap, unwanted_osd_cap)
 
+            caps_list = self._prepare_updated_caps_list(cap, mds_cap_str, osd_cap_str)
             caps = self._rados_command(
                 'auth caps',
                 {
                     'entity': client_entity,
-                    'caps': [
-                        'mds', mds_cap_str,
-                        'osd', osd_cap_str,
-                        'mon', cap['caps'].get('mon', 'allow r')]
+                    'caps': caps_list
                 })
+
             caps = self._rados_command(
                 'auth get',
                 {
@@ -1163,7 +1211,7 @@ class CephFSVolumeClient(object):
 
             volume_path_str = str(volume_path)
             if (auth_meta is None) or (not auth_meta['volumes']):
-                log.warn("deauthorized called for already-removed auth"
+                log.warning("deauthorized called for already-removed auth"
                          "ID '{auth_id}' for volume ID '{volume}'".format(
                     auth_id=auth_id, volume=volume_path.volume_id
                 ))
@@ -1172,7 +1220,7 @@ class CephFSVolumeClient(object):
                 return
 
             if volume_path_str not in auth_meta['volumes']:
-                log.warn("deauthorized called for already-removed auth"
+                log.warning("deauthorized called for already-removed auth"
                          "ID '{auth_id}' for volume ID '{volume}'".format(
                     auth_id=auth_id, volume=volume_path.volume_id
                 ))
@@ -1203,7 +1251,7 @@ class CephFSVolumeClient(object):
             vol_meta = self._volume_metadata_get(volume_path)
 
             if (vol_meta is None) or (auth_id not in vol_meta['auths']):
-                log.warn("deauthorized called for already-removed auth"
+                log.warning("deauthorized called for already-removed auth"
                          "ID '{auth_id}' for volume ID '{volume}'".format(
                     auth_id=auth_id, volume=volume_path.volume_id
                 ))
@@ -1258,8 +1306,8 @@ class CephFSVolumeClient(object):
             )
 
             def cap_remove(orig_mds_caps, orig_osd_caps, want_mds_caps, want_osd_caps):
-                mds_cap_tokens = orig_mds_caps.split(",")
-                osd_cap_tokens = orig_osd_caps.split(",")
+                mds_cap_tokens = [x.strip() for x in orig_mds_caps.split(",")]
+                osd_cap_tokens = [x.strip() for x in orig_osd_caps.split(",")]
 
                 for want_mds_cap, want_osd_cap in zip(want_mds_caps, want_osd_caps):
                     if want_mds_cap in mds_cap_tokens:
@@ -1275,17 +1323,15 @@ class CephFSVolumeClient(object):
             mds_cap_str, osd_cap_str = cap_remove(orig_mds_caps, orig_osd_caps,
                                                   want_mds_caps, want_osd_caps)
 
-            if not mds_cap_str:
+            caps_list = self._prepare_updated_caps_list(cap, mds_cap_str, osd_cap_str, authorize=False)
+            if not caps_list:
                 self._rados_command('auth del', {'entity': client_entity}, decode=False)
             else:
                 self._rados_command(
                     'auth caps',
                     {
                         'entity': client_entity,
-                        'caps': [
-                            'mds', mds_cap_str,
-                            'osd', osd_cap_str,
-                            'mon', cap['caps'].get('mon', 'allow r')]
+                        'caps': caps_list
                     })
 
         # FIXME: rados raising Error instead of ObjectNotFound in auth get failure
@@ -1366,9 +1412,9 @@ class CephFSVolumeClient(object):
             dir_path, self.rados.conf_get('client_snapdir'), snapshot_name
         )
 
-    def _snapshot_create(self, dir_path, snapshot_name):
+    def _snapshot_create(self, dir_path, snapshot_name, mode=0o755):
         # TODO: raise intelligible exception for clusters where snaps are disabled
-        self.fs.mkdir(self._snapshot_path(dir_path, snapshot_name), 0o755)
+        self.fs.mkdir(self._snapshot_path(dir_path, snapshot_name), mode)
 
     def _snapshot_destroy(self, dir_path, snapshot_name):
         """
@@ -1377,19 +1423,20 @@ class CephFSVolumeClient(object):
         try:
             self.fs.rmdir(self._snapshot_path(dir_path, snapshot_name))
         except cephfs.ObjectNotFound:
-            log.warn("Snapshot was already gone: {0}".format(snapshot_name))
+            log.warning("Snapshot was already gone: {0}".format(snapshot_name))
 
-    def create_snapshot_volume(self, volume_path, snapshot_name):
-        self._snapshot_create(self._get_path(volume_path), snapshot_name)
+    def create_snapshot_volume(self, volume_path, snapshot_name, mode=0o755):
+        self._snapshot_create(self._get_path(volume_path), snapshot_name, mode)
 
     def destroy_snapshot_volume(self, volume_path, snapshot_name):
         self._snapshot_destroy(self._get_path(volume_path), snapshot_name)
 
-    def create_snapshot_group(self, group_id, snapshot_name):
+    def create_snapshot_group(self, group_id, snapshot_name, mode=0o755):
         if group_id is None:
             raise RuntimeError("Group ID may not be None")
 
-        return self._snapshot_create(self._get_group_path(group_id), snapshot_name)
+        return self._snapshot_create(self._get_group_path(group_id), snapshot_name,
+                                     mode)
 
     def destroy_snapshot_group(self, group_id, snapshot_name):
         if group_id is None:
@@ -1446,7 +1493,7 @@ class CephFSVolumeClient(object):
             raise CephFSVolumeClientError(msg)
 
         try:
-            with rados.WriteOpCtx(ioctx) as wop:
+            with rados.WriteOpCtx() as wop:
                 if version is not None:
                     wop.assert_version(version)
                 wop.write_full(data)
@@ -1499,6 +1546,6 @@ class CephFSVolumeClient(object):
         try:
             ioctx.remove_object(object_name)
         except rados.ObjectNotFound:
-            log.warn("Object '{0}' was already removed".format(object_name))
+            log.warning("Object '{0}' was already removed".format(object_name))
         finally:
             ioctx.close()

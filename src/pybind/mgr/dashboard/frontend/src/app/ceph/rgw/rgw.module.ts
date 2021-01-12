@@ -1,17 +1,14 @@
 import { CommonModule } from '@angular/common';
 import { NgModule } from '@angular/core';
 import { FormsModule, ReactiveFormsModule } from '@angular/forms';
+import { RouterModule, Routes } from '@angular/router';
 
-import { AlertModule } from 'ngx-bootstrap/alert';
-import { BsDropdownModule } from 'ngx-bootstrap/dropdown';
-import { ModalModule } from 'ngx-bootstrap/modal';
-import { TabsModule } from 'ngx-bootstrap/tabs';
-import { TooltipModule } from 'ngx-bootstrap/tooltip';
+import { NgbNavModule, NgbTooltipModule } from '@ng-bootstrap/ng-bootstrap';
+import { NgxPipeFunctionModule } from 'ngx-pipe-function';
 
-import { AppRoutingModule } from '../../app-routing.module';
-import { SharedModule } from '../../shared/shared.module';
+import { ActionLabels, URLVerbs } from '~/app/shared/constants/app.constants';
+import { SharedModule } from '~/app/shared/shared.module';
 import { PerformanceCounterModule } from '../performance-counter/performance-counter.module';
-import { Rgw501Component } from './rgw-501/rgw-501.component';
 import { RgwBucketDetailsComponent } from './rgw-bucket-details/rgw-bucket-details.component';
 import { RgwBucketFormComponent } from './rgw-bucket-form/rgw-bucket-form.component';
 import { RgwBucketListComponent } from './rgw-bucket-list/rgw-bucket-list.component';
@@ -26,30 +23,18 @@ import { RgwUserSubuserModalComponent } from './rgw-user-subuser-modal/rgw-user-
 import { RgwUserSwiftKeyModalComponent } from './rgw-user-swift-key-modal/rgw-user-swift-key-modal.component';
 
 @NgModule({
-  entryComponents: [
-    RgwDaemonDetailsComponent,
-    RgwBucketDetailsComponent,
-    RgwUserDetailsComponent,
-    RgwUserSwiftKeyModalComponent,
-    RgwUserS3KeyModalComponent,
-    RgwUserCapabilityModalComponent,
-    RgwUserSubuserModalComponent
-  ],
   imports: [
     CommonModule,
     SharedModule,
-    AppRoutingModule,
     FormsModule,
     ReactiveFormsModule,
     PerformanceCounterModule,
-    AlertModule.forRoot(),
-    BsDropdownModule.forRoot(),
-    TabsModule.forRoot(),
-    TooltipModule.forRoot(),
-    ModalModule.forRoot()
+    NgbNavModule,
+    RouterModule,
+    NgbTooltipModule,
+    NgxPipeFunctionModule
   ],
   exports: [
-    Rgw501Component,
     RgwDaemonListComponent,
     RgwDaemonDetailsComponent,
     RgwBucketFormComponent,
@@ -59,7 +44,6 @@ import { RgwUserSwiftKeyModalComponent } from './rgw-user-swift-key-modal/rgw-us
     RgwUserDetailsComponent
   ],
   declarations: [
-    Rgw501Component,
     RgwDaemonListComponent,
     RgwDaemonDetailsComponent,
     RgwBucketFormComponent,
@@ -76,3 +60,51 @@ import { RgwUserSwiftKeyModalComponent } from './rgw-user-swift-key-modal/rgw-us
   ]
 })
 export class RgwModule {}
+
+const routes: Routes = [
+  {
+    path: '',
+    redirectTo: 'daemon',
+    pathMatch: 'full'
+  },
+  { path: 'daemon', component: RgwDaemonListComponent, data: { breadcrumbs: 'Daemons' } },
+  {
+    path: 'user',
+    data: { breadcrumbs: 'Users' },
+    children: [
+      { path: '', component: RgwUserListComponent },
+      {
+        path: URLVerbs.CREATE,
+        component: RgwUserFormComponent,
+        data: { breadcrumbs: ActionLabels.CREATE }
+      },
+      {
+        path: `${URLVerbs.EDIT}/:uid`,
+        component: RgwUserFormComponent,
+        data: { breadcrumbs: ActionLabels.EDIT }
+      }
+    ]
+  },
+  {
+    path: 'bucket',
+    data: { breadcrumbs: 'Buckets' },
+    children: [
+      { path: '', component: RgwBucketListComponent },
+      {
+        path: URLVerbs.CREATE,
+        component: RgwBucketFormComponent,
+        data: { breadcrumbs: ActionLabels.CREATE }
+      },
+      {
+        path: `${URLVerbs.EDIT}/:bid`,
+        component: RgwBucketFormComponent,
+        data: { breadcrumbs: ActionLabels.EDIT }
+      }
+    ]
+  }
+];
+
+@NgModule({
+  imports: [RgwModule, RouterModule.forChild(routes)]
+})
+export class RoutedRgwModule {}

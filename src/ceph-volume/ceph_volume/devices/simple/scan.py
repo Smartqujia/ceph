@@ -7,6 +7,7 @@ import os
 from textwrap import dedent
 from ceph_volume import decorators, terminal, conf
 from ceph_volume.api import lvm
+from ceph_volume.systemd import systemctl
 from ceph_volume.util import arg_validators, system, disk, encryption
 from ceph_volume.util.device import Device
 
@@ -40,7 +41,7 @@ def parse_keyring(file_contents):
 
 class Scan(object):
 
-    help = 'Capture metadata from an OSD data partition or directory'
+    help = 'Capture metadata from all running ceph-disk OSDs, OSD data partition or directory'
 
     def __init__(self, argv):
         self.argv = argv
@@ -79,7 +80,7 @@ class Scan(object):
             device = os.readlink(path)
         else:
             device = path
-        lvm_device = lvm.get_lv_from_argument(device)
+        lvm_device = lvm.get_first_lv(filters={'lv_path': device})
         if lvm_device:
             device_uuid = lvm_device.lv_uuid
         else:
@@ -97,11 +98,17 @@ class Scan(object):
             raise RuntimeError(
                 'OSD files not found, required "keyring" file is not present at: %s' % path
             )
-        for _file in os.listdir(path):
-            file_path = os.path.join(path, _file)
+        for file_ in os.listdir(path):
+            file_path = os.path.join(path, file_)
+            file_json_key = file_
+            if file_.endswith('_dmcrypt'):
+                file_json_key = file_.rstrip('_dmcrypt')
+                logger.info(
+                    'reading file {}, stripping _dmcrypt suffix'.format(file_)
+                )
             if os.path.islink(file_path):
                 if os.path.exists(file_path):
-                    osd_metadata[_file] = self.scan_device(file_path)
+                    osd_metadata[file_json_key] = self.scan_device(file_path)
                 else:
                     msg = 'broken symlink found %s -> %s' % (file_path, os.path.realpath(file_path))
                     terminal.warning(msg)
@@ -125,9 +132,9 @@ class Scan(object):
                 if 'keyring' in file_path:
                     content = parse_keyring(content)
                 try:
-                    osd_metadata[_file] = int(content)
+                    osd_metadata[file_json_key] = int(content)
                 except ValueError:
-                    osd_metadata[_file] = content
+                    osd_metadata[file_json_key] = content
 
         # we must scan the paths again because this might be a temporary mount
         path_mounts = system.get_mounts(paths=True)
@@ -284,7 +291,7 @@ class Scan(object):
 
     def main(self):
         sub_command_help = dedent("""
-        Scan an OSD directory (or data device) for files and configurations
+        Scan running OSDs, an OSD directory (or data device) for files and configurations
         that will allow to take over the management of the OSD.
 
         Scanned OSDs will get their configurations stored in
@@ -293,19 +300,25 @@ class Scan(object):
         For an OSD ID of 0 with fsid of ``a9d50838-e823-43d6-b01f-2f8d0a77afc2``
         that could mean a scan command that looks like::
 
-            ceph-volume lvm scan /var/lib/ceph/osd/ceph-0
+            ceph-volume simple scan /var/lib/ceph/osd/ceph-0
 
         Which would store the metadata in a JSON file at::
 
             /etc/ceph/osd/0-a9d50838-e823-43d6-b01f-2f8d0a77afc2.json
 
-        To a scan an existing, running, OSD:
+        To scan all running OSDs:
+
+            ceph-volume simple scan
+
+        To a scan a specific running OSD:
 
             ceph-volume simple scan /var/lib/ceph/osd/{cluster}-{osd id}
 
         And to scan a device (mounted or unmounted) that has OSD data in it, for example /dev/sda1
 
             ceph-volume simple scan /dev/sda1
+
+        Scanning a device or directory that belongs to an OSD not created by ceph-disk will be ingored.
         """)
         parser = argparse.ArgumentParser(
             prog='ceph-volume simple scan',
@@ -330,25 +343,43 @@ class Scan(object):
             metavar='OSD_PATH',
             type=arg_validators.OSDPath(),
             nargs='?',
+            default=None,
             help='Path to an existing OSD directory or OSD data partition'
         )
 
-        if len(self.argv) == 0:
-            print(sub_command_help)
-            return
-
         args = parser.parse_args(self.argv)
-        device = Device(args.osd_path)
-        if device.is_partition:
-            if device.ceph_disk.type != 'data':
-                label = device.ceph_disk.partlabel
-                msg = 'Device must be the ceph data partition, but PARTLABEL reported: "%s"' % label
-                raise RuntimeError(msg)
+        paths = []
+        if args.osd_path:
+            paths.append(args.osd_path)
+        else:
+            osd_ids = systemctl.get_running_osd_ids()
+            for osd_id in osd_ids:
+                paths.append("/var/lib/ceph/osd/{}-{}".format(
+                    conf.cluster,
+                    osd_id,
+                ))
 
         # Capture some environment status, so that it can be reused all over
         self.device_mounts = system.get_mounts(devices=True)
         self.path_mounts = system.get_mounts(paths=True)
-        self.encryption_metadata = encryption.legacy_encrypted(args.osd_path)
-        self.is_encrypted = self.encryption_metadata['encrypted']
 
-        self.scan(args)
+        for path in paths:
+            args.osd_path = path
+            device = Device(args.osd_path)
+            if device.is_partition:
+                if device.ceph_disk.type != 'data':
+                    label = device.ceph_disk.partlabel
+                    msg = 'Device must be the ceph data partition, but PARTLABEL reported: "%s"' % label
+                    raise RuntimeError(msg)
+
+            self.encryption_metadata = encryption.legacy_encrypted(args.osd_path)
+            self.is_encrypted = self.encryption_metadata['encrypted']
+
+            if self.encryption_metadata['device'] != "tmpfs":
+                device = Device(self.encryption_metadata['device'])
+                if not device.is_ceph_disk_member:
+                    terminal.warning("Ignoring %s because it's not a ceph-disk created osd." % path)
+                else:
+                    self.scan(args)
+            else:
+                terminal.warning("Ignoring %s because it's not a ceph-disk created osd." % path)

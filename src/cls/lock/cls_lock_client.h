@@ -6,15 +6,8 @@
 
 #include <chrono>
 
+#include "include/rados/librados_fwd.hpp"
 #include "cls/lock/cls_lock_types.h"
-
-namespace librados {
-  class AioCompletion;
-  class ObjectWriteOperation;
-  class IoCtx;
-  class ObjectReadOperation;
-  class ObjectOperation;
-}
 
 namespace rados {
   namespace cls {
@@ -51,16 +44,16 @@ namespace rados {
 			    const entity_name_t& locker);
 
       extern int list_locks(librados::IoCtx *ioctx, const std::string& oid,
-			    list<std::string> *locks);
+			    std::list<std::string> *locks);
       extern void get_lock_info_start(librados::ObjectReadOperation *rados_op,
 				      const std::string& name);
       extern int get_lock_info_finish(ceph::bufferlist::const_iterator *out,
-				      map<locker_id_t, locker_info_t> *lockers,
+				      std::map<locker_id_t, locker_info_t> *lockers,
 				      ClsLockType *type, std::string *tag);
 
       extern int get_lock_info(librados::IoCtx *ioctx, const std::string& oid,
 			       const std::string& name,
-			       map<locker_id_t, locker_info_t> *lockers,
+			       std::map<locker_id_t, locker_info_t> *lockers,
 			       ClsLockType *type, std::string *tag);
 
       extern void assert_locked(librados::ObjectOperation *rados_op,

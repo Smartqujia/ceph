@@ -40,7 +40,7 @@ namespace ceph {
 
     ~ErasureCode() override {}
 
-    int init(ErasureCodeProfile &profile, std::ostream *ss) override;
+    int init(ceph::ErasureCodeProfile &profile, std::ostream *ss) override;
 
     const ErasureCodeProfile &get_profile() const override {
       return _profile;
@@ -50,7 +50,7 @@ namespace ceph {
 		    CrushWrapper &crush,
 		    std::ostream *ss) const override;
 
-    int sanity_check_k(int k, std::ostream *ss);
+    int sanity_check_k_m(int k, int m, std::ostream *ss);
 
     unsigned int get_coding_chunk_count() const override {
       return get_chunk_count() - get_data_chunk_count();
@@ -79,9 +79,6 @@ namespace ceph {
                        const bufferlist &in,
                        std::map<int, bufferlist> *encoded) override;
 
-    int encode_chunks(const std::set<int> &want_to_encode,
-                              std::map<int, bufferlist> *encoded) override;
-
     int decode(const std::set<int> &want_to_read,
                 const std::map<int, bufferlist> &chunks,
                 std::map<int, bufferlist> *decoded, int chunk_size) override;
@@ -89,10 +86,6 @@ namespace ceph {
     virtual int _decode(const std::set<int> &want_to_read,
 			const std::map<int, bufferlist> &chunks,
 			std::map<int, bufferlist> *decoded);
-
-    int decode_chunks(const std::set<int> &want_to_read,
-                              const std::map<int, bufferlist> &chunks,
-                              std::map<int, bufferlist> *decoded) override;
 
     const std::vector<int> &get_chunk_mapping() const override;
 

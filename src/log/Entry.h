@@ -41,7 +41,6 @@ public:
   pthread_t m_thread;
   short m_prio, m_subsys;
 
-private:
   static log_clock& clock() {
     static log_clock clock;
     return clock;
@@ -62,14 +61,14 @@ public:
   ~MutableEntry() override = default;
 
   std::ostream& get_ostream() {
-    return cos.get_stream();
+    return *cos;
   }
 
   std::string_view strv() const override {
-    return cos.get_stream().strv();
+    return cos->strv();
   }
   std::size_t size() const override {
-    return cos.get_stream().strv().size();
+    return cos->strv().size();
   }
 
 private:

@@ -23,7 +23,7 @@ def create_dmcrypt_key():
     )
     # The size of the key is defined in bits, so we must transform that
     # value to bytes (dividing by 8) because we read in bytes, not bits
-    random_string = os.urandom(dmcrypt_key_size / 8)
+    random_string = os.urandom(int(dmcrypt_key_size / 8))
     key = base64.b64encode(random_string).decode('utf-8')
     return key
 
@@ -60,6 +60,7 @@ def plain_open(key, device, mapping):
         'cryptsetup',
         '--key-file',
         '-',
+        '--allow-discards',  # allow discards (aka TRIM) requests for device
         'open',
         device,
         mapping,
@@ -84,6 +85,7 @@ def luks_open(key, device, mapping):
         'cryptsetup',
         '--key-file',
         '-',
+        '--allow-discards',  # allow discards (aka TRIM) requests for device
         'luksOpen',
         device,
         mapping,
@@ -101,7 +103,8 @@ def dmcrypt_close(mapping):
         logger.debug('device mapper path does not exist %s' % mapping)
         logger.debug('will skip cryptsetup removal')
         return
-    process.run(['cryptsetup', 'remove', mapping])
+    # don't be strict about the remove call, but still warn on the terminal if it fails
+    process.run(['cryptsetup', 'remove', mapping], stop_on_error=False)
 
 
 def get_dmcrypt_key(osd_id, osd_fsid, lockbox_keyring=None):

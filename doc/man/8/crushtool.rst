@@ -202,7 +202,7 @@ grouped.
 
 Each layer consists of::
 
-       bucket ( uniform | list | tree | straw ) size
+       bucket ( uniform | list | tree | straw | straw2 ) size
 
 The **bucket** is the type of the buckets in the layer
 (e.g. "rack"). Each bucket name will be built by appending a unique
@@ -257,6 +257,14 @@ creating a new Ceph cluster. They can be further edited with::
 
        # recompile
        crushtool -c map.txt -o crushmap
+
+Reclassify
+==========
+
+The *reclassify* function allows users to transition from older maps that
+maintain parallel hierarchies for OSDs of different types to a modern CRUSH
+map that makes use of the *device class* feature.  For more information,
+see https://docs.ceph.com/en/latest/rados/operations/crush-map-edits/#migrating-from-a-legacy-ssd-rule-to-device-classes.
 
 Example output from --test
 ==========================

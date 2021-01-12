@@ -4,9 +4,11 @@ but also a compounded ("single call") helper to do them in order. Some plugins
 may want to change some part of the process, while others might want to consume
 the single-call helper
 """
+import errno
 import os
 import logging
 import json
+import time
 from ceph_volume import process, conf, __release__, terminal
 from ceph_volume.util import system, constants, str_to_int, disk
 
@@ -93,6 +95,7 @@ def get_block_db_size(lv_format=True):
         logger.debug(
             'block.db has no size configuration, will fallback to using as much as possible'
         )
+        # TODO better to return disk.Size(b=0) here
         return None
     logger.debug('bluestore_block_db_size set to %s' % conf_db_size)
     db_size = disk.Size(b=str_to_int(conf_db_size))
@@ -103,6 +106,40 @@ def get_block_db_size(lv_format=True):
     if lv_format:
         return '%sG' % db_size.gb.as_int()
     return db_size
+
+def get_block_wal_size(lv_format=True):
+    """
+    Helper to retrieve the size (defined in megabytes in ceph.conf) to create
+    the block.wal logical volume, it "translates" the string into a float value,
+    then converts that into gigabytes, and finally (optionally) it formats it
+    back as a string so that it can be used for creating the LV.
+
+    :param lv_format: Return a string to be used for ``lv_create``. A 5 GB size
+    would result in '5G', otherwise it will return a ``Size`` object.
+
+    .. note: Configuration values are in bytes, unlike journals which
+             are defined in gigabytes
+    """
+    conf_wal_size = None
+    try:
+        conf_wal_size = conf.ceph.get_safe('osd', 'bluestore_block_wal_size', None)
+    except RuntimeError:
+        logger.exception("failed to load ceph configuration, will use defaults")
+
+    if not conf_wal_size:
+        logger.debug(
+            'block.wal has no size configuration, will fallback to using as much as possible'
+        )
+        return None
+    logger.debug('bluestore_block_wal_size set to %s' % conf_wal_size)
+    wal_size = disk.Size(b=str_to_int(conf_wal_size))
+
+    if wal_size < disk.Size(gb=2):
+        mlogger.error('Refusing to continue with configured size for block.wal')
+        raise RuntimeError('block.wal sizes must be larger than 2GB, detected: %s' % wal_size)
+    if lv_format:
+        return '%sG' % wal_size.gb.as_int()
+    return wal_size
 
 
 def create_id(fsid, json_secrets, osd_id=None):
@@ -300,6 +337,30 @@ def _link_device(device, device_type, osd_id):
 
     process.run(command)
 
+def _validate_bluestore_device(device, excepted_device_type, osd_uuid):
+    """
+    Validate whether the given device is truly what it is supposed to be
+    """
+
+    out, err, ret = process.call(['ceph-bluestore-tool', 'show-label', '--dev', device])
+    if err:
+        terminal.error('ceph-bluestore-tool failed to run. %s'% err)
+        raise SystemExit(1)
+    if ret:
+        terminal.error('no label on %s'% device)
+        raise SystemExit(1)
+    oj = json.loads(''.join(out))
+    if device not in oj:
+        terminal.error('%s not in the output of ceph-bluestore-tool, buggy?'% device)
+        raise SystemExit(1)
+    current_device_type = oj[device]['description']
+    if current_device_type != excepted_device_type:
+        terminal.error('%s is not a %s device but %s'% (device, excepted_device_type, current_device_type))
+        raise SystemExit(1)
+    current_osd_uuid = oj[device]['osd_uuid']
+    if current_osd_uuid != osd_uuid:
+        terminal.error('device %s is used by another osd %s as %s, should be %s'% (device, current_osd_uuid, current_device_type, osd_uuid))
+        raise SystemExit(1)
 
 def link_journal(journal_device, osd_id):
     _link_device(journal_device, 'journal', osd_id)
@@ -309,11 +370,13 @@ def link_block(block_device, osd_id):
     _link_device(block_device, 'block', osd_id)
 
 
-def link_wal(wal_device, osd_id):
+def link_wal(wal_device, osd_id, osd_uuid=None):
+    _validate_bluestore_device(wal_device, 'bluefs wal', osd_uuid)
     _link_device(wal_device, 'block.wal', osd_id)
 
 
-def link_db(db_device, osd_id):
+def link_db(db_device, osd_id, osd_uuid=None):
+    _validate_bluestore_device(db_device, 'bluefs db', osd_uuid)
     _link_device(db_device, 'block.db', osd_id)
 
 
@@ -337,6 +400,10 @@ def get_monmap(osd_id):
         '--keyring', bootstrap_keyring,
         'mon', 'getmap', '-o', monmap_destination
     ])
+
+
+def get_osdspec_affinity():
+    return os.environ.get('CEPH_VOLUME_OSDSPEC_AFFINITY', '')
 
 
 def osd_mkfs_bluestore(osd_id, fsid, keyring=None, wal=False, db=False):
@@ -389,11 +456,28 @@ def osd_mkfs_bluestore(osd_id, fsid, keyring=None, wal=False, db=False):
         )
         system.chown(db)
 
+    if get_osdspec_affinity():
+        base_command.extend(['--osdspec-affinity', get_osdspec_affinity()])
+
     command = base_command + supplementary_command
 
-    _, _, returncode = process.call(command, stdin=keyring, show_command=True)
-    if returncode != 0:
-        raise RuntimeError('Command failed with exit code %s: %s' % (returncode, ' '.join(command)))
+    """
+    When running in containers the --mkfs on raw device sometimes fails
+    to acquire a lock through flock() on the device because systemd-udevd holds one temporarily.
+    See KernelDevice.cc and _lock() to understand how ceph-osd acquires the lock.
+    Because this is really transient, we retry up to 5 times and wait for 1 sec in-between
+    """
+    for retry in range(5):
+        _, _, returncode = process.call(command, stdin=keyring, terminal_verbose=True, show_command=True)
+        if returncode == 0:
+            break
+        else:
+            if returncode == errno.EWOULDBLOCK:
+                    time.sleep(1)
+                    logger.info('disk is held by another process, trying to mkfs again... (%s/5 attempt)' % retry)
+                    continue
+            else:
+                raise RuntimeError('Command failed with exit code %s: %s' % (returncode, ' '.join(command)))
 
 
 def osd_mkfs_filestore(osd_id, fsid, keyring):
@@ -424,6 +508,9 @@ def osd_mkfs_filestore(osd_id, fsid, keyring):
         '-i', osd_id,
         '--monmap', monmap,
     ]
+
+    if get_osdspec_affinity():
+        command.extend(['--osdspec-affinity', get_osdspec_affinity()])
 
     if __release__ != 'luminous':
         # goes through stdin

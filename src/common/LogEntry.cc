@@ -8,6 +8,17 @@
 #include "Formatter.h"
 #include "include/stringify.h"
 
+using std::list;
+using std::map;
+using std::make_pair;
+using std::pair;
+using std::string;
+
+using ceph::bufferlist;
+using ceph::decode;
+using ceph::encode;
+using ceph::Formatter;
+
 // ----
 // LogEntryKey
 
@@ -197,7 +208,7 @@ void LogEntry::encode(bufferlist& bl, uint64_t features) const
     __u16 t = prio;
     entity_inst_t who;
     who.name = rank;
-    who.addr = addrs.legacy_addr();
+    who.addr = addrs.as_legacy_addr();
     encode(who, bl, features);
     encode(stamp, bl);
     encode(seq, bl);
@@ -372,4 +383,3 @@ void LogSummary::generate_test_instances(list<LogSummary*>& o)
   o.push_back(new LogSummary);
   // more!
 }
-

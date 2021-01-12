@@ -2,7 +2,7 @@
  Configuration
 ===============
 
-Each Ceph process, daemon or utility draws its configuration from
+Each Ceph process, daemon, or utility draws its configuration from
 several sources on startup, include a local configuration, the
 monitors, the command line, or environment variables.  Configuration
 options may be set globally such that they apply to all daemons, to
@@ -33,6 +33,7 @@ To optimize the performance of your cluster, refer to the following:
 
    Common Settings <common>
    Network Settings <network-config-ref>
+   Messenger v2 protocol <msgr2>
    Auth Settings <auth-config-ref>
    Monitor Settings <mon-config-ref>
    mon-lookup-dns

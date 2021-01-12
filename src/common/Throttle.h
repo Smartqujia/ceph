@@ -6,12 +6,11 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <iostream>
 #include <list>
 #include <map>
-#include <mutex>
 
+#include "common/ceph_mutex.h"
 #include "include/Context.h"
 #include "common/ThrottleInterface.h"
 #include "common/Timer.h"
@@ -50,7 +49,7 @@ private:
        (c >= m && cur > m));     // except for large c
   }
 
-  bool _wait(int64_t c, UNIQUE_LOCK_T(lock)& l);
+  bool _wait(int64_t c, std::unique_lock<std::mutex>& l);
 
 public:
   /**
@@ -118,11 +117,8 @@ public:
    */
   void reset();
 
-  bool should_wait(int64_t c) const {
-    return _should_wait(c);
-  }
   void reset_max(int64_t m) {
-    auto l = ceph::uniquely_lock(lock);
+    std::lock_guard l(lock);
     _reset_max(m);
   }
 };
@@ -164,12 +160,12 @@ class BackoffThrottle {
   unsigned next_cond = 0;
 
   /// allocated once to avoid constantly allocating new ones
-  vector<std::condition_variable> conds;
+  std::vector<std::condition_variable> conds;
 
   const bool use_perf;
 
   /// pointers into conds
-  list<std::condition_variable*> waiters;
+  std::list<std::condition_variable*> waiters;
 
   std::list<std::condition_variable*>::iterator _push_waiter() {
     unsigned next = next_cond++;
@@ -199,7 +195,7 @@ class BackoffThrottle {
   uint64_t max = 0;
   uint64_t current = 0;
 
-  std::chrono::duration<double> _get_delay(uint64_t c) const;
+  ceph::timespan _get_delay(uint64_t c) const;
 
 public:
   /**
@@ -216,10 +212,10 @@ public:
     double high_multiple,
     double max_multiple,
     uint64_t throttle_max,
-    ostream *errstream);
+    std::ostream *errstream);
 
-  std::chrono::duration<double> get(uint64_t c = 1);
-  std::chrono::duration<double> wait() {
+  ceph::timespan get(uint64_t c = 1);
+  ceph::timespan wait() {
     return get(0);
   }
   uint64_t put(uint64_t c = 1);
@@ -328,7 +324,7 @@ private:
 
   TidResult m_tid_result;
 
-  void complete_pending_ops(UNIQUE_LOCK_T(m_lock)& l);
+  void complete_pending_ops(std::unique_lock<std::mutex>& l);
   uint32_t waiters = 0;
 };
 
@@ -340,13 +336,15 @@ class TokenBucketThrottle {
 
     uint64_t remain;
     uint64_t max;
+    uint64_t capacity;
+    uint64_t available;
 
     Bucket(CephContext *cct, const std::string &name, uint64_t m)
-      : cct(cct), name(name), remain(m), max(m) {}
+      : cct(cct), name(name), remain(m), max(m), capacity(m), available(m) {}
 
     uint64_t get(uint64_t c);
-    uint64_t put(uint64_t c);
-    void set_max(uint64_t m);
+    uint64_t put(uint64_t tokens, double burst_ratio);
+    void set_max(uint64_t max, uint64_t burst_seconds);
   };
 
   struct Blocker {
@@ -358,14 +356,15 @@ class TokenBucketThrottle {
   };
 
   CephContext *m_cct;
+  const std::string m_name;
   Bucket m_throttle;
-  uint64_t m_avg = 0;
   uint64_t m_burst = 0;
+  uint64_t m_avg = 0;
   SafeTimer *m_timer;
-  Mutex *m_timer_lock;
-  FunctionContext *m_token_ctx = nullptr;
-  list<Blocker> m_blockers;
-  Mutex m_lock;
+  ceph::mutex *m_timer_lock;
+  Context *m_token_ctx = nullptr;
+  std::list<Blocker> m_blockers;
+  ceph::mutex m_lock;
 
   // minimum of the filling period.
   uint64_t m_tick_min = 50;
@@ -407,34 +406,37 @@ class TokenBucketThrottle {
   double m_schedule_tick = 1.0;
 
 public:
-  TokenBucketThrottle(CephContext *cct, uint64_t capacity, uint64_t avg,
-                      SafeTimer *timer, Mutex *timer_lock);
-  
+  TokenBucketThrottle(CephContext *cct, const std::string &name,
+                      uint64_t burst, uint64_t avg,
+                      SafeTimer *timer, ceph::mutex *timer_lock);
+
   ~TokenBucketThrottle();
 
-  template <typename T, typename I, void(T::*MF)(int, I*, uint64_t)>
-  void add_blocker(uint64_t c, T *handler, I *item, uint64_t flag) {
-    Context *ctx = new FunctionContext([handler, item, flag](int r) {
-      (handler->*MF)(r, item, flag);
+  const std::string &get_name() {
+    return m_name;
+  }
+
+  template <typename T, typename MF, typename I>
+  void add_blocker(uint64_t c, T&& t, MF&& mf, I&& item, uint64_t flag) {
+    auto ctx = new LambdaContext(
+      [t, mf, item=std::forward<I>(item), flag](int) mutable {
+        (t->*mf)(std::forward<I>(item), flag);
       });
     m_blockers.emplace_back(c, ctx);
   }
-  
-  template <typename T, typename I, void(T::*MF)(int, I*, uint64_t)>
-  bool get(uint64_t c, T *handler, I *item, uint64_t flag) {
-    if (0 == c)
-      return false;
 
+  template <typename T, typename MF, typename I>
+  bool get(uint64_t c, T&& t, MF&& mf, I&& item, uint64_t flag) {
     bool wait = false;
     uint64_t got = 0;
-    std::lock_guard<Mutex> lock(m_lock);
+    std::lock_guard lock(m_lock);
     if (!m_blockers.empty()) {
       // Keep the order of requests, add item after previous blocked requests.
       wait = true;
     } else {
       if (0 == m_throttle.max || 0 == m_avg)
         return false;
-  
+
       got = m_throttle.get(c);
       if (got < c) {
         // Not enough tokens, add a blocker for it.
@@ -442,13 +444,15 @@ public:
       }
     }
 
-    if (wait)
-      add_blocker<T, I, MF>(c - got, handler, item, flag);
+    if (wait) {
+      add_blocker(c - got, std::forward<T>(t), std::forward<MF>(mf),
+                  std::forward<I>(item), flag);
+    }
 
     return wait;
   }
-  
-  int set_limit(uint64_t average, uint64_t burst);
+
+  int set_limit(uint64_t average, uint64_t burst, uint64_t burst_seconds);
   void set_schedule_tick_min(uint64_t tick);
 
 private:

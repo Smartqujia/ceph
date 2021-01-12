@@ -1,16 +1,19 @@
 // -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// vim: ts=8 sw=2 smarttab ft=cpp
+
 /**
  * Crypto filters for Put/Post/Get operations.
  */
+
 #ifndef CEPH_RGW_CRYPT_H
 #define CEPH_RGW_CRYPT_H
+
+#include <string_view>
 
 #include <rgw/rgw_op.h>
 #include <rgw/rgw_rest.h>
 #include <rgw/rgw_rest_s3.h>
 #include "rgw_putobj.h"
-#include <boost/utility/string_view.hpp>
 
 /**
  * \brief Interface for block encryption methods
@@ -94,6 +97,10 @@ class RGWGetObj_BlockDecrypt : public RGWGetObj_Filter {
   off_t end; /**< stream offset of last byte that is requested */
   bufferlist cache; /**< stores extra data that could not (yet) be processed by BlockCrypt */
   size_t block_size; /**< snapshot of \ref BlockCrypt.get_block_size() */
+
+  int process(bufferlist& cipher, size_t part_ofs, size_t size);
+
+protected:
   std::vector<size_t> parts_len; /**< size of parts of multipart object, parsed from manifest */
 public:
   RGWGetObj_BlockDecrypt(CephContext* cct,

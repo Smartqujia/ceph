@@ -9,6 +9,10 @@
 
 #include "include/compat.h"
 
+using std::list;
+
+using ceph::bufferlist;
+
 CLS_VER(1,0)
 CLS_NAME(version)
 
@@ -66,10 +70,11 @@ static int read_version(cls_method_context_t hctx, obj_version *objv, bool impli
   try {
     auto iter = bl.cbegin();
     decode(*objv, iter);
-  } catch (buffer::error& err) {
+  } catch (ceph::buffer::error& err) {
     CLS_LOG(0, "ERROR: read_version(): failed to decode version entry\n");
     return -EIO;
   }
+  CLS_LOG(20, "cls_version: read_version %s:%d", objv->tag.c_str(), (int)objv->ver);
 
   return 0;
 }
@@ -81,7 +86,7 @@ static int cls_version_set(cls_method_context_t hctx, bufferlist *in, bufferlist
   cls_version_set_op op;
   try {
     decode(op, in_iter);
-  } catch (buffer::error& err) {
+  } catch (ceph::buffer::error& err) {
     CLS_LOG(1, "ERROR: cls_version_get(): failed to decode entry\n");
     return -EINVAL;
   }
@@ -147,7 +152,7 @@ static int cls_version_inc(cls_method_context_t hctx, bufferlist *in, bufferlist
   cls_version_inc_op op;
   try {
     decode(op, in_iter);
-  } catch (buffer::error& err) {
+  } catch (ceph::buffer::error& err) {
     CLS_LOG(1, "ERROR: cls_version_get(): failed to decode entry\n");
     return -EINVAL;
   }
@@ -176,7 +181,7 @@ static int cls_version_check(cls_method_context_t hctx, bufferlist *in, bufferli
   cls_version_check_op op;
   try {
     decode(op, in_iter);
-  } catch (buffer::error& err) {
+  } catch (ceph::buffer::error& err) {
     CLS_LOG(1, "ERROR: cls_version_get(): failed to decode entry\n");
     return -EINVAL;
   }
@@ -185,8 +190,7 @@ static int cls_version_check(cls_method_context_t hctx, bufferlist *in, bufferli
   int ret = read_version(hctx, &objv, false);
   if (ret < 0)
     return ret;
-  CLS_LOG(20, "cls_version: read_version %s:%d", objv.tag.c_str(), (int)objv.ver);
-  
+
   if (!check_conds(op.conds, objv)) {
     CLS_LOG(20, "cls_version: failed condition check");
     return -ECANCELED;

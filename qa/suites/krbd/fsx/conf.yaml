@@ -4,4 +4,4 @@ overrides:
       global:
         ms die on skipped message: false
       client:
-        rbd default features: 5
+        rbd default map options: read_from_replica=balance

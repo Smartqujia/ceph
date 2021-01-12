@@ -8,7 +8,7 @@ add_library(compressor_objs OBJECT ${compressor_srcs})
 
 ## compressor plugins
 
-set(compressor_plugin_dir ${CMAKE_INSTALL_PKGLIBDIR}/compressor)
+set(compressor_plugin_dir ${CEPH_INSTALL_PKGLIBDIR}/compressor)
 
 add_subdirectory(snappy)
 add_subdirectory(zlib)
@@ -20,6 +20,11 @@ endif()
 
 if(HAVE_BROTLI)
   add_subdirectory(brotli)
+endif()
+
+add_library(compressor STATIC ${compressor_srcs})
+if(HAVE_QATZIP)
+  target_link_libraries(compressor PRIVATE ${QATZIP_LIBRARIES})
 endif()
 
 set(ceph_compressor_libs

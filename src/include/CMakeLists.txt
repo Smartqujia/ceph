@@ -1,6 +1,8 @@
-install(FILES rados/librados.h
+install(FILES
+  rados/librados.h
   rados/rados_types.h
   rados/rados_types.hpp
+  rados/librados_fwd.hpp
   rados/librados.hpp
   buffer.h
   buffer_fwd.h
@@ -28,6 +30,5 @@ if(WITH_RADOSGW)
   install(FILES
     rados/librgw.h
     rados/rgw_file.h
-    rgw/librgw_admin_user.h
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rados)
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rados)
 endif()

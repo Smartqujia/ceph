@@ -1,6 +1,8 @@
 import { Component } from '@angular/core';
 
-import { BsModalRef } from 'ngx-bootstrap/modal';
+import { NgbActiveModal } from '@ng-bootstrap/ng-bootstrap';
+
+import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
 
 @Component({
   selector: 'cd-rgw-user-swift-key-modal',
@@ -10,8 +12,13 @@ import { BsModalRef } from 'ngx-bootstrap/modal';
 export class RgwUserSwiftKeyModalComponent {
   user: string;
   secret_key: string;
+  resource: string;
+  action: string;
 
-  constructor(public bsModalRef: BsModalRef) {}
+  constructor(public activeModal: NgbActiveModal, public actionLabels: ActionLabelsI18n) {
+    this.resource = $localize`Swift Key`;
+    this.action = this.actionLabels.SHOW;
+  }
 
   /**
    * Set the values displayed in the dialog.

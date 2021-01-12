@@ -1,31 +1,47 @@
-import { Component, OnInit } from '@angular/core';
+import { Component, OnDestroy, OnInit } from '@angular/core';
 
-import * as _ from 'lodash';
+import { Subscription } from 'rxjs';
 
-import { NotificationType } from '../../../shared/enum/notification-type.enum';
-import { CdNotification } from '../../../shared/models/cd-notification';
-import { NotificationService } from '../../../shared/services/notification.service';
+import { Icons } from '~/app/shared/enum/icons.enum';
+import { CdNotification } from '~/app/shared/models/cd-notification';
+import { NotificationService } from '~/app/shared/services/notification.service';
+import { SummaryService } from '~/app/shared/services/summary.service';
 
 @Component({
   selector: 'cd-notifications',
   templateUrl: './notifications.component.html',
   styleUrls: ['./notifications.component.scss']
 })
-export class NotificationsComponent implements OnInit {
-  notifications: CdNotification[];
-  notificationType = NotificationType;
+export class NotificationsComponent implements OnInit, OnDestroy {
+  icons = Icons;
+  hasRunningTasks = false;
+  hasNotifications = false;
+  private subs = new Subscription();
 
-  constructor(private notificationService: NotificationService) {
-    this.notifications = [];
-  }
+  constructor(
+    public notificationService: NotificationService,
+    private summaryService: SummaryService
+  ) {}
 
   ngOnInit() {
-    this.notificationService.data$.subscribe((notifications: CdNotification[]) => {
-      this.notifications = _.orderBy(notifications, ['timestamp'], ['desc']);
-    });
+    this.subs.add(
+      this.summaryService.subscribe((summary) => {
+        this.hasRunningTasks = summary.executing_tasks.length > 0;
+      })
+    );
+
+    this.subs.add(
+      this.notificationService.data$.subscribe((notifications: CdNotification[]) => {
+        this.hasNotifications = notifications.length > 0;
+      })
+    );
   }
 
-  removeAll() {
-    this.notificationService.removeAll();
+  ngOnDestroy(): void {
+    this.subs.unsubscribe();
+  }
+
+  toggleSidebar() {
+    this.notificationService.toggleSidebar();
   }
 }

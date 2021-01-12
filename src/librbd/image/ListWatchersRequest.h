@@ -19,6 +19,7 @@ namespace image {
 enum {
   LIST_WATCHERS_FILTER_OUT_MY_INSTANCE = 1 << 0,
   LIST_WATCHERS_FILTER_OUT_MIRROR_INSTANCES = 1 << 1,
+  LIST_WATCHERS_MIRROR_INSTANCES_ONLY = 1 << 3,
 };
 
 template<typename ImageCtxT = ImageCtx>
@@ -40,9 +41,6 @@ private:
    *    |
    *    v
    * LIST_IMAGE_WATCHERS
-   *    |
-   *    v
-   * GET_MIRROR_IMAGE (skip if not needed)
    *    |
    *    v
    * LIST_MIRROR_WATCHERS (skip if not needed)
@@ -69,9 +67,6 @@ private:
 
   void list_image_watchers();
   void handle_list_image_watchers(int r);
-
-  void get_mirror_image();
-  void handle_get_mirror_image(int r);
 
   void list_mirror_watchers();
   void handle_list_mirror_watchers(int r);

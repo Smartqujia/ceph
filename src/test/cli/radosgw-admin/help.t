@@ -4,6 +4,7 @@
     user create                create a new user
     user modify                modify user
     user info                  get user info
+    user rename                rename user
     user rm                    remove user
     user suspend               suspend a user
     user enable                re-enable user after suspension
@@ -17,26 +18,33 @@
     subuser rm                 remove subuser
     key create                 create access key
     key rm                     remove access key
-    bucket list                list buckets
+    bucket list                list buckets (specify --allow-unordered for
+                               faster, unsorted listing)
     bucket limit check         show bucket sharding stats
     bucket link                link bucket to specified user
     bucket unlink              unlink bucket from specified user
     bucket stats               returns bucket statistics
     bucket rm                  remove bucket
     bucket check               check bucket index
+    bucket chown               link bucket to specified user and update its object ACLs
     bucket reshard             reshard bucket
     bucket rewrite             rewrite all objects in the specified bucket
+    bucket sync checkpoint     poll a bucket's sync status until it catches up to its remote
     bucket sync disable        disable bucket sync
     bucket sync enable         enable bucket sync
+    bucket radoslist           list rados objects backing bucket's objects
     bi get                     retrieve bucket index object entries
     bi put                     store bucket index object entries
     bi list                    list raw bucket index entries
     bi purge                   purge bucket index entries
     object rm                  remove object
+    object put                 put object
     object stat                stat an object for its metadata
     object unlink              unlink object from bucket index
     object rewrite             rewrite the specified object
     objects expire             run expired objects cleanup
+    objects expire-stale list  list stale expired objects (caused by reshard)
+    objects expire-stale rm    remove stale expired objects
     period rm                  remove a period
     period get                 get period info
     period get-current         get current period info
@@ -65,7 +73,7 @@
     zonegroup add              add a zone to a zonegroup
     zonegroup create           create a new zone group info
     zonegroup default          set default zone group
-    zonegroup rm               remove a zone group info
+    zonegroup delete           delete a zone group info
     zonegroup get              show zone group info
     zonegroup modify           modify an existing zonegroup
     zonegroup set              set zone group info (requires infile)
@@ -73,6 +81,7 @@
     zonegroup rename           rename a zone group
     zonegroup list             list all zone groups set on this cluster
     zonegroup placement list   list zonegroup's placement targets
+    zonegroup placement get    get a placement target of a specific zonegroup
     zonegroup placement add    add a placement target id to a zonegroup
     zonegroup placement modify modify a placement target of a specific zonegroup
     zonegroup placement rm     remove a placement target from a zonegroup
@@ -85,6 +94,7 @@
     zone list                  list all zones set on this cluster
     zone rename                rename a zone
     zone placement list        list zone's placement targets
+    zone placement get         get a zone placement target
     zone placement add         add a zone placement target
     zone placement modify      modify a zone placement target
     zone placement rm          remove a zone placement target
@@ -112,23 +122,26 @@
     gc process                 manually process garbage (specify
                                --include-all to process all entries, including unexpired)
     lc list                    list all bucket lifecycle progress
+    lc get                     get a lifecycle bucket configuration
     lc process                 manually process lifecycle
+    lc reshard fix             fix LC for a resharded bucket
     metadata get               get metadata info
     metadata put               put metadata info
     metadata rm                remove metadata info
     metadata list              list metadata info
     mdlog list                 list metadata log
-    mdlog trim                 trim metadata log (use start-date, end-date or
-                               start-marker, end-marker)
+    mdlog trim                 trim metadata log (use marker)
     mdlog status               read metadata log status
     bilog list                 list bucket index log
     bilog trim                 trim bucket index log (use start-marker, end-marker)
+    bilog status               read bucket index log status
     datalog list               list data log
     datalog trim               trim data log
     datalog status             read data log status
-    orphans find               init and run search for leaked rados objects (use job-id, pool)
-    orphans finish             clean up search for leaked rados objects
-    orphans list-jobs          list the current job-ids for orphans search
+    orphans find               deprecated -- init and run search for leaked rados objects (use job-id, pool)
+    orphans finish             deprecated -- clean up search for leaked rados objects
+    orphans list-jobs          deprecated -- list the current job-ids for orphans search
+                             * the three 'orphans' sub-commands are now deprecated; consider using the `rgw-orphan-list` tool
     role create                create a AWS role for use with STS
     role rm                    remove a role
     role get                   get a role
@@ -143,6 +156,8 @@
     reshard status             read bucket resharding status
     reshard process            process of scheduled reshard jobs
     reshard cancel             cancel resharding a bucket
+    reshard stale-instances list list stale-instances from bucket resharding
+    reshard stale-instances rm   cleanup stale-instances from bucket resharding
     sync error list            list sync error
     sync error trim            trim sync error
     mfa create                 create a new MFA TOTP token
@@ -151,9 +166,24 @@
     mfa remove                 delete MFA TOTP token
     mfa check                  check MFA TOTP token
     mfa resync                 re-sync MFA TOTP token
+    topic list                 list bucket notifications/pubsub topics
+    topic get                  get a bucket notifications/pubsub topic
+    topic rm                   remove a bucket notifications/pubsub topic
+    subscription get           get a pubsub subscription definition
+    subscription rm            remove a pubsub subscription
+    subscription pull          show events in a pubsub subscription
+    subscription ack           ack (remove) an events in a pubsub subscription
+    script put                 upload a lua script to a context
+    script get                 get the lua script of a context
+    script rm                  remove the lua scripts of a context
+    script-package add         add a lua package to the scripts allowlist
+    script-package rm          remove a lua package from the scripts allowlist
+    script-package list        get the lua packages allowlist
   options:
      --tenant=<tenant>         tenant name
+     --user_ns=<namespace>     namespace of user (oidc in case of users authenticated with oidc provider)
      --uid=<id>                user id
+     --new-uid=<id>            new user id
      --subuser=<name>          subuser name
      --access-key=<key>        S3 access key
      --email=<email>           user's email address
@@ -173,10 +203,13 @@
      --bucket=<bucket>         Specify the bucket name. Also used by the quota command.
      --pool=<pool>             Specify the pool name. Also used to scan for leaked rados objects.
      --object=<object>         object name
+     --object-version=<version>         object version
      --date=<date>             date in the format yyyy-mm-dd
      --start-date=<date>       start date in the format yyyy-mm-dd
      --end-date=<date>         end date in the format yyyy-mm-dd
      --bucket-id=<bucket-id>   bucket id
+     --bucket-new-name=<bucket>
+                               for bucket link: optional new name
      --shard-id=<shard-id>     optional for: 
                                  mdlog list
                                  data sync status
@@ -207,6 +240,7 @@
      --read-only               set zone as read-only (when adding to zonegroup)
      --redirect-zone           specify zone id to redirect when response is 404 (not found)
      --placement-id            placement id for zonegroup placement commands
+     --storage-class           storage class for zonegroup placement commands
      --tags=<list>             list of tags for zonegroup placement add and modify commands
      --tags-add=<list>         list of tags to add for zonegroup placement modify command
      --tags-rm=<list>          list of tags to remove for zonegroup placement modify command
@@ -227,6 +261,7 @@
                                set list of zones to sync from
      --sync-from-rm=[zone-name][,...]
                                remove zones from list of zones to sync from
+     --bucket-index-max-shards override a zone/zonegroup's default bucket index shard count
      --fix                     besides checking bucket index, will also fix it
      --check-objects           bucket check: rebuilds bucket index according to
                                actual objects state
@@ -248,6 +283,7 @@
      --infile=<file>           specify a file to read in when setting data
      --categories=<list>       comma separated list of categories, used in usage show
      --caps=<caps>             list of caps (e.g., "usage=read, write; user=read")
+     --op-mask=<op-mask>       permission of user's operations (e.g., "read, write, delete, *")
      --yes-i-really-mean-it    required for certain operations
      --warnings-only           when specified with bucket limit check, list
                                only buckets nearing or over the current max
@@ -261,6 +297,7 @@
      --min-rewrite-stripe-size min stripe size for object rewrite (default 0)
      --trim-delay-ms           time interval in msec to limit the frequency of sync error log entries trimming operations,
                                the trimming process will sleep the specified msec for every 1000 entries trimmed
+     --max-concurrent-ios      maximum concurrent ios for bucket operations (default: 32)
   
   <date> := "YYYY-MM-DD[ hh:mm:ss]"
   
@@ -273,7 +310,7 @@
      --num-shards              num of shards to use for keeping the temporary scan info
      --orphan-stale-secs       num of seconds to wait before declaring an object to be an orphan (default: 86400)
      --job-id                  set the job id (for orphans find)
-     --max-concurrent-ios      maximum concurrent ios for orphans find (default: 32)
+     --detail                  detailed mode, log and stat head objects as well
   
   Orphans list-jobs options:
      --extra-info              provide extra info in job list
@@ -292,6 +329,16 @@
      --totp-seconds            the time resolution that is being used for TOTP generation
      --totp-window             the number of TOTP tokens that are checked before and after the current token when validating token
      --totp-pin                the valid value of a TOTP token at a certain time
+  
+  Bucket notifications/pubsub options:
+     --topic                   bucket notifications/pubsub topic name
+     --subscription            pubsub subscription name
+     --event-id                event id in a pubsub subscription
+  
+  Script options:
+     --context                 context in which the script runs. one of: preRequest, postRequest
+     --package                 name of the lua package that should be added/removed to/from the allowlist
+     --allow-compilation       package is allowed to compile C code as part of its installation
   
     --conf/-c FILE    read configuration from the given configuration file
     --id ID           set ID portion of my name

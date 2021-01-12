@@ -1,5 +1,6 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// vim: ts=8 sw=2 smarttab ft=cpp
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -11,6 +12,7 @@
  * Foundation.  See file COPYING.
  *
  */
+
 #include "include/compat.h"
 #include <sys/types.h>
 #include <string.h>
@@ -35,7 +37,6 @@
 #include "common/common_init.h"
 #include "common/dout.h"
 
-#include "rgw_rados.h"
 #include "rgw_resolve.h"
 #include "rgw_op.h"
 #include "rgw_rest.h"
@@ -51,6 +52,9 @@
 #include "rgw_lib_frontend.h"
 #include "rgw_http_client.h"
 #include "rgw_http_client_curl.h"
+#include "rgw_perf_counters.h"
+
+#include "services/svc_zone.h"
 
 #include <errno.h>
 #include <thread>
@@ -119,13 +123,14 @@ namespace rgw {
 	RGWLibFS* fs = iter->first->ref();
 	uniq.unlock();
 	fs->gc();
+	fs->update_user();
 	fs->rele();
 	uniq.lock();
 	if (cur_gen != gen)
 	  goto restart; /* invalidated */
       }
+      cv.wait_for(uniq, std::chrono::seconds(delay_s));
       uniq.unlock();
-      std::this_thread::sleep_for(std::chrono::seconds(delay_s));
     }
   }
 
@@ -222,14 +227,16 @@ namespace rgw {
     rgw_env.set("HTTP_HOST", "");
 
     /* XXX and -then- bloat up req_state with string copies from it */
-    const uint64_t reqid = store->get_new_req_id();
-    struct req_state rstate(req->cct, &rgw_env, req->get_user(), reqid);
+    struct req_state rstate(req->cct, &rgw_env, req->id);
     struct req_state *s = &rstate;
 
     // XXX fix this
     s->cio = io;
 
     RGWObjectCtx rados_ctx(store, s); // XXX holds std::map
+
+    auto sysobj_ctx = store->svc()->sysobj->init_obj_ctx();
+    s->sysobj_ctx = &sysobj_ctx;
 
     /* XXX and -then- stash req_state pointers everywhere they are needed */
     ret = req->init(rgw_env, &rados_ctx, io, s);
@@ -252,67 +259,73 @@ namespace rgw {
     rgw_env.set("REQUEST_URI", s->info.request_uri);
     rgw_env.set("QUERY_STRING", "");
 
-    /* XXX authorize does less here then in the REST path, e.g.,
-     * the user's info is cached, but still incomplete */
-    ldpp_dout(s, 2) << "authorizing" << dendl;
-    ret = req->authorize(op);
-    if (ret < 0) {
-      dout(10) << "failed to authorize request" << dendl;
-      abort_req(s, op, ret);
-      goto done;
-    }
-
-    /* FIXME: remove this after switching all handlers to the new authentication
-     * infrastructure. */
-    if (! s->auth.identity) {
-      s->auth.identity = rgw::auth::transform_old_authinfo(s);
-    }
-
-    ldpp_dout(s, 2) << "reading op permissions" << dendl;
-    ret = req->read_permissions(op);
-    if (ret < 0) {
-      abort_req(s, op, ret);
-      goto done;
-    }
-
-    ldpp_dout(s, 2) << "init op" << dendl;
-    ret = op->init_processing();
-    if (ret < 0) {
-      abort_req(s, op, ret);
-      goto done;
-    }
-
-    ldpp_dout(s, 2) << "verifying op mask" << dendl;
-    ret = op->verify_op_mask();
-    if (ret < 0) {
-      abort_req(s, op, ret);
-      goto done;
-    }
-
-    ldpp_dout(s, 2) << "verifying op permissions" << dendl;
-    ret = op->verify_permission();
-    if (ret < 0) {
-      if (s->system_request) {
-	dout(2) << "overriding permissions due to system operation" << dendl;
-      } else if (s->auth.identity->is_admin_of(s->user->user_id)) {
-	dout(2) << "overriding permissions due to admin operation" << dendl;
-      } else {
+    try {
+      /* XXX authorize does less here then in the REST path, e.g.,
+       * the user's info is cached, but still incomplete */
+      ldpp_dout(s, 2) << "authorizing" << dendl;
+      ret = req->authorize(op, null_yield);
+      if (ret < 0) {
+	dout(10) << "failed to authorize request" << dendl;
 	abort_req(s, op, ret);
 	goto done;
       }
-    }
 
-    ldpp_dout(s, 2) << "verifying op params" << dendl;
-    ret = op->verify_params();
-    if (ret < 0) {
-      abort_req(s, op, ret);
-      goto done;
-    }
+      /* FIXME: remove this after switching all handlers to the new
+       * authentication infrastructure. */
+      if (! s->auth.identity) {
+	s->auth.identity = rgw::auth::transform_old_authinfo(s);
+      }
 
-    ldpp_dout(s, 2) << "executing" << dendl;
-    op->pre_exec();
-    op->execute();
-    op->complete();
+      ldpp_dout(s, 2) << "reading op permissions" << dendl;
+      ret = req->read_permissions(op, null_yield);
+      if (ret < 0) {
+	abort_req(s, op, ret);
+	goto done;
+      }
+
+      ldpp_dout(s, 2) << "init op" << dendl;
+      ret = op->init_processing(null_yield);
+      if (ret < 0) {
+	abort_req(s, op, ret);
+	goto done;
+      }
+
+      ldpp_dout(s, 2) << "verifying op mask" << dendl;
+      ret = op->verify_op_mask();
+      if (ret < 0) {
+	abort_req(s, op, ret);
+	goto done;
+      }
+
+      ldpp_dout(s, 2) << "verifying op permissions" << dendl;
+      ret = op->verify_permission(null_yield);
+      if (ret < 0) {
+	if (s->system_request) {
+	  dout(2) << "overriding permissions due to system operation" << dendl;
+	} else if (s->auth.identity->is_admin_of(s->user->get_id())) {
+	  dout(2) << "overriding permissions due to admin operation" << dendl;
+	} else {
+	  abort_req(s, op, ret);
+	  goto done;
+	}
+      }
+
+      ldpp_dout(s, 2) << "verifying op params" << dendl;
+      ret = op->verify_params();
+      if (ret < 0) {
+	abort_req(s, op, ret);
+	goto done;
+      }
+
+      ldpp_dout(s, 2) << "executing" << dendl;
+      op->pre_exec();
+      op->execute(null_yield);
+      op->complete();
+
+    } catch (const ceph::crypto::DigestException& e) {
+      dout(0) << "authentication failed" << e.what() << dendl;
+      abort_req(s, op, -ERR_INVALID_SECRET_KEY);
+    }
 
   done:
     try {
@@ -322,7 +335,7 @@ namespace rgw {
               << e.what() << dendl;
     }
     if (should_log) {
-      rgw_log_op(store, nullptr /* !rest */, s,
+      rgw_log_op(store->getRados(), nullptr /* !rest */, s,
 		 (op ? op->name() : "unknown"), olog);
     }
 
@@ -358,9 +371,21 @@ namespace rgw {
     }
 
     struct req_state* s = req->get_state();
+    RGWLibIO& io_ctx = req->get_io();
+    RGWEnv& rgw_env = io_ctx.get_env();
+    RGWObjectCtx& rados_ctx = req->get_octx();
+
+    rgw_env.set("HTTP_HOST", "");
+
+    int ret = req->init(rgw_env, &rados_ctx, &io_ctx, s);
+    if (ret < 0) {
+      dout(10) << "failed to initialize request" << dendl;
+      abort_req(s, op, ret);
+      goto done;
+    }
 
     /* req is-a RGWOp, currently initialized separately */
-    int ret = req->op_init();
+    ret = req->op_init();
     if (ret < 0) {
       dout(10) << "failed to initialize RGWOp" << dendl;
       abort_req(s, op, ret);
@@ -370,7 +395,7 @@ namespace rgw {
     /* XXX authorize does less here then in the REST path, e.g.,
      * the user's info is cached, but still incomplete */
     ldpp_dout(s, 2) << "authorizing" << dendl;
-    ret = req->authorize(op);
+    ret = req->authorize(op, null_yield);
     if (ret < 0) {
       dout(10) << "failed to authorize request" << dendl;
       abort_req(s, op, ret);
@@ -384,14 +409,14 @@ namespace rgw {
     }
 
     ldpp_dout(s, 2) << "reading op permissions" << dendl;
-    ret = req->read_permissions(op);
+    ret = req->read_permissions(op, null_yield);
     if (ret < 0) {
       abort_req(s, op, ret);
       goto done;
     }
 
     ldpp_dout(s, 2) << "init op" << dendl;
-    ret = op->init_processing();
+    ret = op->init_processing(null_yield);
     if (ret < 0) {
       abort_req(s, op, ret);
       goto done;
@@ -405,11 +430,11 @@ namespace rgw {
     }
 
     ldpp_dout(s, 2) << "verifying op permissions" << dendl;
-    ret = op->verify_permission();
+    ret = op->verify_permission(null_yield);
     if (ret < 0) {
       if (s->system_request) {
 	dout(2) << "overriding permissions due to system operation" << dendl;
-      } else if (s->auth.identity->is_admin_of(s->user->user_id)) {
+      } else if (s->auth.identity->is_admin_of(s->user->get_id())) {
 	dout(2) << "overriding permissions due to admin operation" << dendl;
       } else {
 	abort_req(s, op, ret);
@@ -447,6 +472,8 @@ namespace rgw {
 	    << " op status=" << op_ret
 	    << " ======" << dendl;
 
+    perfcounter->inc(l_rgw_req);
+
     return ret;
   }
 
@@ -479,12 +506,12 @@ namespace rgw {
 		      CODE_ENVIRONMENT_DAEMON,
 		      CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS);
 
-    Mutex mutex("main");
+    ceph::mutex mutex = ceph::make_mutex("main");
     SafeTimer init_timer(g_ceph_context, mutex);
     init_timer.init();
-    mutex.Lock();
+    mutex.lock();
     init_timer.add_event_after(g_conf()->rgw_init_timeout, new C_InitTimeout);
-    mutex.Unlock();
+    mutex.unlock();
 
     common_init_finish(g_ceph_context);
 
@@ -494,18 +521,34 @@ namespace rgw {
     rgw::curl::setup_curl(boost::none);
     rgw_http_client_init(g_ceph_context);
 
+    auto run_gc =
+      g_conf()->rgw_enable_gc_threads &&
+      g_conf()->rgw_nfs_run_gc_threads;
+
+    auto run_lc =
+      g_conf()->rgw_enable_lc_threads &&
+      g_conf()->rgw_nfs_run_lc_threads;
+
+    auto run_quota =
+      g_conf()->rgw_enable_quota_threads &&
+      g_conf()->rgw_nfs_run_quota_threads;
+
+    auto run_sync =
+      g_conf()->rgw_run_sync_thread &&
+      g_conf()->rgw_nfs_run_sync_thread;
+
     store = RGWStoreManager::get_storage(g_ceph_context,
-					 g_conf()->rgw_enable_gc_threads,
-					 g_conf()->rgw_enable_lc_threads,
-					 g_conf()->rgw_enable_quota_threads,
-					 g_conf()->rgw_run_sync_thread,
-					 g_conf()->rgw_dynamic_resharding);
+					 run_gc,
+					 run_lc,
+					 run_quota,
+					 run_sync,
+					 g_conf().get_val<bool>("rgw_dynamic_resharding"));
 
     if (!store) {
-      mutex.Lock();
+      mutex.lock();
       init_timer.cancel_all_events();
       init_timer.shutdown();
-      mutex.Unlock();
+      mutex.unlock();
 
       derr << "Couldn't init storage provider (RADOS)" << dendl;
       return -EIO;
@@ -513,12 +556,12 @@ namespace rgw {
 
     r = rgw_perf_start(g_ceph_context);
 
-    rgw_rest_init(g_ceph_context, store, store->svc.zone->get_zonegroup());
+    rgw_rest_init(g_ceph_context, store->svc()->zone->get_zonegroup());
 
-    mutex.Lock();
+    mutex.lock();
     init_timer.cancel_all_events();
     init_timer.shutdown();
-    mutex.Unlock();
+    mutex.unlock();
 
     if (r)
       return -EIO;
@@ -536,9 +579,7 @@ namespace rgw {
     ldh->init();
     ldh->bind();
 
-    rgw_user_init(store);
-    rgw_bucket_init(store->meta_mgr);
-    rgw_log_usage_init(g_ceph_context, store);
+    rgw_log_usage_init(g_ceph_context, store->getRados());
 
     // XXX ex-RGWRESTMgr_lib, mgr->set_logging(true)
 
@@ -570,7 +611,7 @@ namespace rgw {
 
     fe->run();
 
-    r = store->register_to_service_map("rgw-nfs", service_map_meta);
+    r = store->getRados()->register_to_service_map("rgw-nfs", service_map_meta);
     if (r < 0) {
       derr << "ERROR: failed to register to service map: " << cpp_strerror(-r) << dendl;
       /* ignore error */
@@ -613,9 +654,9 @@ namespace rgw {
     return 0;
   } /* RGWLib::stop() */
 
-  int RGWLibIO::set_uid(RGWRados *store, const rgw_user& uid)
+  int RGWLibIO::set_uid(rgw::sal::RGWRadosStore *store, const rgw_user& uid)
   {
-    int ret = rgw_get_user_info_by_uid(store, uid, user_info, NULL);
+    int ret = store->ctl()->user->get_info_by_uid(uid, &user_info, null_yield);
     if (ret < 0) {
       derr << "ERROR: failed reading user info: uid=" << uid << " ret="
 	   << ret << dendl;
@@ -623,10 +664,10 @@ namespace rgw {
     return ret;
   }
 
-  int RGWLibRequest::read_permissions(RGWOp* op) {
+  int RGWLibRequest::read_permissions(RGWOp* op, optional_yield y) {
     /* bucket and object ops */
     int ret =
-      rgw_build_bucket_policies(rgwlib.get_store(), get_state());
+      rgw_build_bucket_policies(rgwlib.get_store(), get_state(), y);
     if (ret < 0) {
       ldout(get_state()->cct, 10) << "read_permissions (bucket policy) on "
 				  << get_state()->bucket << ":"
@@ -638,7 +679,7 @@ namespace rgw {
     } else if (! only_bucket()) {
       /* object ops */
       ret = rgw_build_object_policies(rgwlib.get_store(), get_state(),
-				      op->prefetch_data());
+				      op->prefetch_data(), y);
       if (ret < 0) {
 	ldout(get_state()->cct, 10) << "read_permissions (object policy) on"
 				    << get_state()->bucket << ":"
@@ -651,7 +692,7 @@ namespace rgw {
     return ret;
   } /* RGWLibRequest::read_permissions */
 
-  int RGWHandler_Lib::authorize(const DoutPrefixProvider *dpp)
+  int RGWHandler_Lib::authorize(const DoutPrefixProvider *dpp, optional_yield y)
   {
     /* TODO: handle
      *  1. subusers
@@ -665,8 +706,8 @@ namespace rgw {
     s->perm_mask = RGW_PERM_FULL_CONTROL;
 
     // populate the owner info
-    s->owner.set_id(s->user->user_id);
-    s->owner.set_name(s->user->display_name);
+    s->owner.set_id(s->user->get_id());
+    s->owner.set_name(s->user->get_display_name());
 
     return 0;
   } /* RGWHandler_Lib::authorize */

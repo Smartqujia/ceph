@@ -1,14 +1,16 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// vim: ts=8 sw=2 smarttab ft=cpp
 
 #include <algorithm>
 #include <map>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/armor.h"
 #include "common/utf8.h"
+#include "rgw_rest_s3.h"
 #include "rgw_auth_s3.h"
 #include "rgw_common.h"
 #include "rgw_client_io.h"
@@ -16,7 +18,7 @@
 #include "rgw_crypt_sanitize.h"
 
 #include <boost/container/small_vector.hpp>
-#include <boost/utility/string_view.hpp>
+#include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/trim_all.hpp>
 
 #define dout_context g_ceph_context
@@ -32,6 +34,8 @@ static const auto signed_subresources = {
   "notification",
   "partNumber",
   "policy",
+  "policyStatus",
+  "publicAccessBlock",
   "requestPayment",
   "response-cache-control",
   "response-content-disposition",
@@ -46,7 +50,8 @@ static const auto signed_subresources = {
   "versionId",
   "versioning",
   "versions",
-  "website"
+  "website",
+  "object-lock"
 };
 
 /*
@@ -54,7 +59,7 @@ static const auto signed_subresources = {
  */
 
 static std::string
-get_canon_amz_hdr(const std::map<std::string, std::string>& meta_map)
+get_canon_amz_hdr(const meta_map_t& meta_map)
 {
   std::string dest;
 
@@ -115,7 +120,8 @@ void rgw_create_s3_canonical_header(
   const char* const content_md5,
   const char* const content_type,
   const char* const date,
-  const std::map<std::string, std::string>& meta_map,
+  const meta_map_t& meta_map,
+  const meta_map_t& qs_map,
   const char* const request_uri,
   const std::map<std::string, std::string>& sub_resources,
   std::string& dest_str)
@@ -143,6 +149,7 @@ void rgw_create_s3_canonical_header(
   dest.append("\n");
 
   dest.append(get_canon_amz_hdr(meta_map));
+  dest.append(get_canon_amz_hdr(qs_map));
   dest.append(get_canon_resource(request_uri, sub_resources));
 
   dest_str = dest;
@@ -150,6 +157,17 @@ void rgw_create_s3_canonical_header(
 
 static inline bool is_base64_for_content_md5(unsigned char c) {
   return (isalnum(c) || isspace(c) || (c == '+') || (c == '/') || (c == '='));
+}
+
+static inline void get_v2_qs_map(const req_info& info,
+				 meta_map_t& qs_map) {
+  const auto& params = const_cast<RGWHTTPArgs&>(info.args).get_params();
+  for (const auto& elt : params) {
+    std::string k = boost::algorithm::to_lower_copy(elt.first);
+    if (k.find("x-amz-meta-") == /* offset */ 0) {
+      rgw_add_amz_meta_header(qs_map, k, elt.second);
+    }
+  }
 }
 
 /*
@@ -175,7 +193,10 @@ bool rgw_create_s3_canonical_header(const req_info& info,
   const char *content_type = info.env->get("CONTENT_TYPE");
 
   std::string date;
+  meta_map_t qs_map;
+
   if (qsr) {
+    get_v2_qs_map(info, qs_map); // handle qs metadata
     date = info.args.get("Expires");
   } else {
     const char *str = info.env->get("HTTP_X_AMZ_DATE");
@@ -200,6 +221,7 @@ bool rgw_create_s3_canonical_header(const req_info& info,
         return false;
       }
       *header_time = utime_t(internal_timegm(&t), 0);
+      *header_time -= t.tm_gmtoff;
     }
   }
 
@@ -214,15 +236,13 @@ bool rgw_create_s3_canonical_header(const req_info& info,
   }
 
   rgw_create_s3_canonical_header(info.method, content_md5, content_type,
-                                 date.c_str(), meta_map, request_uri.c_str(),
-                                 sub_resources, dest);
+                                 date.c_str(), meta_map, qs_map,
+				 request_uri.c_str(), sub_resources, dest);
   return true;
 }
 
 
-namespace rgw {
-namespace auth {
-namespace s3 {
+namespace rgw::auth::s3 {
 
 bool is_time_skew_ok(time_t t)
 {
@@ -240,27 +260,27 @@ bool is_time_skew_ok(time_t t)
 }
 
 static inline int parse_v4_query_string(const req_info& info,              /* in */
-                                        boost::string_view& credential,    /* out */
-                                        boost::string_view& signedheaders, /* out */
-                                        boost::string_view& signature,     /* out */
-                                        boost::string_view& date,          /* out */
-                                        boost::string_view& sessiontoken)  /* out */
+                                        std::string_view& credential,    /* out */
+                                        std::string_view& signedheaders, /* out */
+                                        std::string_view& signature,     /* out */
+                                        std::string_view& date,          /* out */
+                                        std::string_view& sessiontoken)  /* out */
 {
   /* auth ships with req params ... */
 
   /* look for required params */
-  credential = info.args.get("X-Amz-Credential");
+  credential = info.args.get("x-amz-credential");
   if (credential.size() == 0) {
     return -EPERM;
   }
 
-  date = info.args.get("X-Amz-Date");
+  date = info.args.get("x-amz-date");
   struct tm date_t;
   if (!parse_iso8601(sview2cstr(date).data(), &date_t, nullptr, false)) {
     return -EPERM;
   }
 
-  boost::string_view expires = info.args.get("X-Amz-Expires");
+  std::string_view expires = info.args.get("x-amz-expires");
   if (expires.empty()) {
     return -EPERM;
   }
@@ -280,18 +300,18 @@ static inline int parse_v4_query_string(const req_info& info,              /* in
     return -EPERM;
   }
 
-  signedheaders = info.args.get("X-Amz-SignedHeaders");
+  signedheaders = info.args.get("x-amz-signedheaders");
   if (signedheaders.size() == 0) {
     return -EPERM;
   }
 
-  signature = info.args.get("X-Amz-Signature");
+  signature = info.args.get("x-amz-signature");
   if (signature.size() == 0) {
     return -EPERM;
   }
 
-  if (info.args.exists("X-Amz-Security-Token")) {
-    sessiontoken = info.args.get("X-Amz-Security-Token");
+  if (info.args.exists("x-amz-security-token")) {
+    sessiontoken = info.args.get("x-amz-security-token");
     if (sessiontoken.size() == 0) {
       return -EPERM;
     }
@@ -300,19 +320,19 @@ static inline int parse_v4_query_string(const req_info& info,              /* in
   return 0;
 }
 
-static bool get_next_token(const boost::string_view& s,
+static bool get_next_token(const std::string_view& s,
                            size_t& pos,
                            const char* const delims,
-                           boost::string_view& token)
+                           std::string_view& token)
 {
   const size_t start = s.find_first_not_of(delims, pos);
-  if (start == boost::string_view::npos) {
+  if (start == std::string_view::npos) {
     pos = s.size();
     return false;
   }
 
   size_t end = s.find_first_of(delims, start);
-  if (end != boost::string_view::npos)
+  if (end != std::string_view::npos)
     pos = end + 1;
   else {
     pos = end = s.size();
@@ -323,13 +343,13 @@ static bool get_next_token(const boost::string_view& s,
 }
 
 template<std::size_t ExpectedStrNum>
-boost::container::small_vector<boost::string_view, ExpectedStrNum>
-get_str_vec(const boost::string_view& str, const char* const delims)
+boost::container::small_vector<std::string_view, ExpectedStrNum>
+get_str_vec(const std::string_view& str, const char* const delims)
 {
-  boost::container::small_vector<boost::string_view, ExpectedStrNum> str_vec;
+  boost::container::small_vector<std::string_view, ExpectedStrNum> str_vec;
 
   size_t pos = 0;
-  boost::string_view token;
+  std::string_view token;
   while (pos < str.size()) {
     if (get_next_token(str, pos, delims, token)) {
       if (token.size() > 0) {
@@ -342,21 +362,21 @@ get_str_vec(const boost::string_view& str, const char* const delims)
 }
 
 template<std::size_t ExpectedStrNum>
-boost::container::small_vector<boost::string_view, ExpectedStrNum>
-get_str_vec(const boost::string_view& str)
+boost::container::small_vector<std::string_view, ExpectedStrNum>
+get_str_vec(const std::string_view& str)
 {
   const char delims[] = ";,= \t";
   return get_str_vec<ExpectedStrNum>(str, delims);
 }
 
 static inline int parse_v4_auth_header(const req_info& info,               /* in */
-                                       boost::string_view& credential,     /* out */
-                                       boost::string_view& signedheaders,  /* out */
-                                       boost::string_view& signature,      /* out */
-                                       boost::string_view& date,           /* out */
-                                       boost::string_view& sessiontoken)   /* out */
+                                       std::string_view& credential,     /* out */
+                                       std::string_view& signedheaders,  /* out */
+                                       std::string_view& signature,      /* out */
+                                       std::string_view& date,           /* out */
+                                       std::string_view& sessiontoken)   /* out */
 {
-  boost::string_view input(info.env->get("HTTP_AUTHORIZATION", ""));
+  std::string_view input(info.env->get("HTTP_AUTHORIZATION", ""));
   try {
     input = input.substr(::strlen(AWS4_HMAC_SHA256_STR) + 1);
   } catch (std::out_of_range&) {
@@ -366,7 +386,7 @@ static inline int parse_v4_auth_header(const req_info& info,               /* in
     return -EINVAL;
   }
 
-  std::map<boost::string_view, boost::string_view> kv;
+  std::map<std::string_view, std::string_view> kv;
   for (const auto& s : get_str_vec<4>(input, ",")) {
     const auto parsed_pair = parse_key_value(s);
     if (parsed_pair) {
@@ -378,7 +398,7 @@ static inline int parse_v4_auth_header(const req_info& info,               /* in
     }
   }
 
-  static const std::array<boost::string_view, 3> required_keys = {
+  static const std::array<std::string_view, 3> required_keys = {
     "Credential",
     "SignedHeaders",
     "Signature"
@@ -422,16 +442,16 @@ static inline int parse_v4_auth_header(const req_info& info,               /* in
   return 0;
 }
 
-int parse_credentials(const req_info& info,                     /* in */
-                      boost::string_view& access_key_id,        /* out */
-                      boost::string_view& credential_scope,     /* out */
-                      boost::string_view& signedheaders,        /* out */
-                      boost::string_view& signature,            /* out */
-                      boost::string_view& date,                 /* out */
-                      boost::string_view& session_token,        /* out */
-                      const bool using_qs)                      /* in */
+int parse_v4_credentials(const req_info& info,                     /* in */
+			 std::string_view& access_key_id,        /* out */
+			 std::string_view& credential_scope,     /* out */
+			 std::string_view& signedheaders,        /* out */
+			 std::string_view& signature,            /* out */
+			 std::string_view& date,                 /* out */
+			 std::string_view& session_token,        /* out */
+			 const bool using_qs)                      /* in */
 {
-  boost::string_view credential;
+  std::string_view credential;
   int ret;
   if (using_qs) {
     ret = parse_v4_query_string(info, credential, signedheaders,
@@ -479,7 +499,7 @@ std::string get_v4_canonical_qs(const req_info& info, const bool using_qs)
   }
   if (params->find_first_of('+') != std::string::npos) {
     copy_params = *params;
-    boost::replace_all(copy_params, "+", " ");
+    boost::replace_all(copy_params, "+", "%20");
     params = &copy_params;
   }
 
@@ -487,7 +507,7 @@ std::string get_v4_canonical_qs(const req_info& info, const bool using_qs)
    * aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html */
   std::map<std::string, std::string> canonical_qs_map;
   for (const auto& s : get_str_vec<5>(*params, "&")) {
-    boost::string_view key, val;
+    std::string_view key, val;
     const auto parsed_pair = parse_key_value(s);
     if (parsed_pair) {
       std::tie(key, val) = *parsed_pair;
@@ -498,7 +518,7 @@ std::string get_v4_canonical_qs(const req_info& info, const bool using_qs)
       key = s;
     }
 
-    if (using_qs && key == "X-Amz-Signature") {
+    if (using_qs && boost::iequals(key, "X-Amz-Signature")) {
       /* Preserving the original behaviour of get_v4_canonical_qs() here. */
       continue;
     }
@@ -529,11 +549,11 @@ std::string get_v4_canonical_qs(const req_info& info, const bool using_qs)
 
 boost::optional<std::string>
 get_v4_canonical_headers(const req_info& info,
-                         const boost::string_view& signedheaders,
+                         const std::string_view& signedheaders,
                          const bool using_qs,
                          const bool force_boto2_compat)
 {
-  std::map<boost::string_view, std::string> canonical_hdrs_map;
+  std::map<std::string_view, std::string> canonical_hdrs_map;
   for (const auto& token : get_str_vec<5>(signedheaders, ";")) {
     /* TODO(rzarzynski): we'd like to switch to sstring here but it should
      * get push_back() and reserve() first. */
@@ -552,7 +572,7 @@ get_v4_canonical_headers(const req_info& info,
     }
     const char* const t = info.env->get(token_env.c_str());
     if (!t) {
-      dout(10) << "warning env var not available" << dendl;
+      dout(10) << "warning env var not available " << token_env.c_str() << dendl;
       continue;
     }
 
@@ -566,8 +586,8 @@ get_v4_canonical_headers(const req_info& info,
     }
 
     if (force_boto2_compat && using_qs && token == "host") {
-      boost::string_view port = info.env->get("SERVER_PORT", "");
-      boost::string_view secure_port = info.env->get("SERVER_PORT_SECURE", "");
+      std::string_view port = info.env->get("SERVER_PORT", "");
+      std::string_view secure_port = info.env->get("SERVER_PORT_SECURE", "");
 
       if (!secure_port.empty()) {
 	if (secure_port != "443")
@@ -585,7 +605,7 @@ get_v4_canonical_headers(const req_info& info,
 
   std::string canonical_hdrs;
   for (const auto& header : canonical_hdrs_map) {
-    const boost::string_view& name = header.first;
+    const std::string_view& name = header.first;
     std::string value = header.second;
     boost::trim_all<std::string>(value);
 
@@ -605,12 +625,12 @@ get_v4_canonical_headers(const req_info& info,
  */
 sha256_digest_t
 get_v4_canon_req_hash(CephContext* cct,
-                      const boost::string_view& http_verb,
+                      const std::string_view& http_verb,
                       const std::string& canonical_uri,
                       const std::string& canonical_qs,
                       const std::string& canonical_hdrs,
-                      const boost::string_view& signed_hdrs,
-                      const boost::string_view& request_payload_hash)
+                      const std::string_view& signed_hdrs,
+                      const std::string_view& request_payload_hash)
 {
   ldout(cct, 10) << "payload request hash = " << request_payload_hash << dendl;
 
@@ -624,9 +644,10 @@ get_v4_canon_req_hash(CephContext* cct,
 
   const auto canonical_req_hash = calc_hash_sha256(canonical_req);
 
-  ldout(cct, 10) << "canonical request = " << canonical_req << dendl;
+  using sanitize = rgw::crypt_sanitize::log_content;
+  ldout(cct, 10) << "canonical request = " << sanitize{canonical_req} << dendl;
   ldout(cct, 10) << "canonical request hash = "
-                 << buf_to_hex(canonical_req_hash).data() << dendl;
+                 << canonical_req_hash << dendl;
 
   return canonical_req_hash;
 }
@@ -638,14 +659,13 @@ get_v4_canon_req_hash(CephContext* cct,
  */
 AWSEngine::VersionAbstractor::string_to_sign_t
 get_v4_string_to_sign(CephContext* const cct,
-                      const boost::string_view& algorithm,
-                      const boost::string_view& request_date,
-                      const boost::string_view& credential_scope,
+                      const std::string_view& algorithm,
+                      const std::string_view& request_date,
+                      const std::string_view& credential_scope,
                       const sha256_digest_t& canonreq_hash)
 {
-  const auto hexed_cr_hash = buf_to_hex(canonreq_hash);
-  const boost::string_view hexed_cr_hash_str(hexed_cr_hash.data(),
-                                             hexed_cr_hash.size() - 1);
+  const auto hexed_cr_hash = canonreq_hash.to_str();
+  const std::string_view hexed_cr_hash_str(hexed_cr_hash);
 
   const auto string_to_sign = string_join_reserve("\n",
     algorithm,
@@ -661,10 +681,10 @@ get_v4_string_to_sign(CephContext* const cct,
 }
 
 
-static inline std::tuple<boost::string_view,            /* date */
-                         boost::string_view,            /* region */
-                         boost::string_view>            /* service */
-parse_cred_scope(boost::string_view credential_scope)
+static inline std::tuple<std::string_view,            /* date */
+                         std::string_view,            /* region */
+                         std::string_view>            /* service */
+parse_cred_scope(std::string_view credential_scope)
 {
   /* date cred */
   size_t pos = credential_scope.find("/");
@@ -684,7 +704,7 @@ parse_cred_scope(boost::string_view credential_scope)
 }
 
 static inline std::vector<unsigned char>
-transform_secret_key(const boost::string_view& secret_access_key)
+transform_secret_key(const std::string_view& secret_access_key)
 {
   /* TODO(rzarzynski): switch to constexpr when C++14 becomes available. */
   static const std::initializer_list<unsigned char> AWS4 { 'A', 'W', 'S', '4' };
@@ -710,10 +730,10 @@ transform_secret_key(const boost::string_view& secret_access_key)
  */
 static sha256_digest_t
 get_v4_signing_key(CephContext* const cct,
-                   const boost::string_view& credential_scope,
-                   const boost::string_view& secret_access_key)
+                   const std::string_view& credential_scope,
+                   const std::string_view& secret_access_key)
 {
-  boost::string_view date, region, service;
+  std::string_view date, region, service;
   std::tie(date, region, service) = parse_cred_scope(credential_scope);
 
   const auto utfed_sec_key = transform_secret_key(secret_access_key);
@@ -723,12 +743,12 @@ get_v4_signing_key(CephContext* const cct,
 
   /* aws4_request */
   const auto signing_key = calc_hmac_sha256(service_k,
-                                            boost::string_view("aws4_request"));
+                                            std::string_view("aws4_request"));
 
-  ldout(cct, 10) << "date_k    = " << buf_to_hex(date_k).data() << dendl;
-  ldout(cct, 10) << "region_k  = " << buf_to_hex(region_k).data() << dendl;
-  ldout(cct, 10) << "service_k = " << buf_to_hex(service_k).data() << dendl;
-  ldout(cct, 10) << "signing_k = " << buf_to_hex(signing_key).data() << dendl;
+  ldout(cct, 10) << "date_k    = " << date_k << dendl;
+  ldout(cct, 10) << "region_k  = " << region_k << dendl;
+  ldout(cct, 10) << "service_k = " << service_k << dendl;
+  ldout(cct, 10) << "signing_k = " << signing_key << dendl;
 
   return signing_key;
 }
@@ -743,9 +763,9 @@ get_v4_signing_key(CephContext* const cct,
  * dynamic allocations.
  */
 AWSEngine::VersionAbstractor::server_signature_t
-get_v4_signature(const boost::string_view& credential_scope,
+get_v4_signature(const std::string_view& credential_scope,
                  CephContext* const cct,
-                 const boost::string_view& secret_key,
+                 const std::string_view& secret_key,
                  const AWSEngine::VersionAbstractor::string_to_sign_t& string_to_sign)
 {
   auto signing_key = get_v4_signing_key(cct, credential_scope, secret_key);
@@ -757,8 +777,8 @@ get_v4_signature(const boost::string_view& credential_scope,
    * the non-const data() variant like C++17's std::string. */
   using srv_signature_t = AWSEngine::VersionAbstractor::server_signature_t;
   srv_signature_t signature(srv_signature_t::initialized_later(),
-                            digest.size() * 2);
-  buf_to_hex(digest.data(), digest.size(), signature.begin());
+                            digest.SIZE * 2);
+  buf_to_hex(digest.v, digest.SIZE, signature.begin());
 
   ldout(cct, 10) << "generated signature = " << signature << dendl;
 
@@ -780,8 +800,8 @@ get_v2_signature(CephContext* const cct,
   char buf[64];
   const int ret = ceph_armor(std::begin(buf),
                              std::begin(buf) + 64,
-                             std::begin(digest),
-                             std::begin(digest) + digest.size());
+                             reinterpret_cast<const char *>(digest.v),
+                             reinterpret_cast<const char *>(digest.v + digest.SIZE));
   if (ret < 0) {
     ldout(cct, 10) << "ceph_armor failed" << dendl;
     throw ret;
@@ -815,10 +835,10 @@ AWSv4ComplMulti::ChunkMeta::create_next(CephContext* const cct,
                                         const char* const metabuf,
                                         const size_t metabuf_len)
 {
-  boost::string_ref metastr(metabuf, metabuf_len);
+  std::string_view metastr(metabuf, metabuf_len);
 
   const size_t semicolon_pos = metastr.find(";");
-  if (semicolon_pos == boost::string_ref::npos) {
+  if (semicolon_pos == std::string_view::npos) {
     ldout(cct, 20) << "AWSv4ComplMulti cannot find the ';' separator"
                    << dendl;
     throw rgw::io::Exception(EINVAL, std::system_category());
@@ -836,7 +856,7 @@ AWSv4ComplMulti::ChunkMeta::create_next(CephContext* const cct,
   /* Parse the chunk_signature=... part. */
   const auto signature_part = metastr.substr(semicolon_pos + 1);
   const size_t eq_sign_pos = signature_part.find("=");
-  if (eq_sign_pos == boost::string_ref::npos) {
+  if (eq_sign_pos == std::string_view::npos) {
     ldout(cct, 20) << "AWSv4ComplMulti: cannot find the '=' separator"
                    << dendl;
     throw rgw::io::Exception(EINVAL, std::system_category());
@@ -844,7 +864,7 @@ AWSv4ComplMulti::ChunkMeta::create_next(CephContext* const cct,
 
   /* OK, we have at least the beginning of a signature. */
   const size_t data_sep_pos = signature_part.find("\r\n");
-  if (data_sep_pos == boost::string_ref::npos) {
+  if (data_sep_pos == std::string_view::npos) {
     ldout(cct, 20) << "AWSv4ComplMulti: no new line at signature end"
                    << dendl;
     throw rgw::io::Exception(EINVAL, std::system_category());
@@ -888,10 +908,9 @@ AWSv4ComplMulti::calc_chunk_signature(const std::string& payload_hash) const
                  << dendl;
 
   /* new chunk signature */
-  const auto sighex = buf_to_hex(calc_hmac_sha256(signing_key,
-                                                  string_to_sign));
+  const auto sig = calc_hmac_sha256(signing_key, string_to_sign);
   /* FIXME(rzarzynski): std::string here is really unnecessary. */
-  return std::string(sighex.data(), sighex.size() - 1);
+  return sig.to_str();
 }
 
 
@@ -1041,9 +1060,9 @@ bool AWSv4ComplMulti::complete()
 
 rgw::auth::Completer::cmplptr_t
 AWSv4ComplMulti::create(const req_state* const s,
-                        boost::string_view date,
-                        boost::string_view credential_scope,
-                        boost::string_view seed_signature,
+                        std::string_view date,
+                        std::string_view credential_scope,
+                        std::string_view seed_signature,
                         const boost::optional<std::string>& secret_key)
 {
   if (!secret_key) {
@@ -1113,6 +1132,4 @@ AWSv4ComplSingle::create(const req_state* const s,
   return std::make_shared<AWSv4ComplSingle>(s);
 }
 
-} /* namespace s3 */
-} /* namespace auth */
-} /* namespace rgw */
+} // namespace rgw::auth::s3

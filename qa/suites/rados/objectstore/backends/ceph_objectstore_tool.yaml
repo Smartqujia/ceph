@@ -12,7 +12,9 @@ tasks:
       global:
         osd max object name len: 460
         osd max object namespace len: 64
-    log-whitelist:
+      osd:
+        osd objectstore: filestore
+    log-ignorelist:
       - overall HEALTH_
       - \(OSDMAP_FLAGS\)
       - \(OSD_

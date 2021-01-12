@@ -18,8 +18,8 @@
 #include "auth/AuthClientHandler.h"
 #include "CephxProtocol.h"
 #include "auth/RotatingKeyRing.h"
+#include "include/common_fwd.h"
 
-class CephContext;
 class KeyRing;
 
 class CephxClientHandler : public AuthClientHandler {
@@ -48,14 +48,13 @@ public:
     reset();
   }
 
-  void reset() override {
-    starting = true;
-    server_challenge = 0;
-  }
+  void reset() override;
   void prepare_build_request() override;
-  int build_request(bufferlist& bl) const override;
-  int handle_response(int ret, bufferlist::const_iterator& iter) override;
-  bool build_rotating_request(bufferlist& bl) const override;
+  int build_request(ceph::buffer::list& bl) const override;
+  int handle_response(int ret, ceph::buffer::list::const_iterator& iter,
+		      CryptoKey *session_key,
+		      std::string *connection_secret) override;
+  bool build_rotating_request(ceph::buffer::list& bl) const override;
 
   int get_protocol() const override { return CEPH_AUTH_CEPHX; }
 

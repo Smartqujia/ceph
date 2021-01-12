@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import
 
-from .helper import ControllerTestCase
-from ..controllers import BaseController, RESTController, Controller, \
-                          ApiController, Endpoint
+from ..controllers import ApiController, BaseController, Controller, Endpoint, RESTController
+from . import ControllerTestCase  # pylint: disable=no-name-in-module
 
 
 @Controller("/btest/{key}", base_url="/ui", secure=False)
@@ -175,7 +174,7 @@ class ControllersTest(ControllerTestCase):
         self.assertStatus(200)
         self.assertJsonBody({'key': '300', 'data': 30})
 
-    def test_rest_resourse(self):
+    def test_rest_resource(self):
         self._get('/test/api/rtest/{}/{}/{}/rmethod?opt=4'.format(300, 2, 3))
         self.assertStatus(200)
         self.assertJsonBody({'key': '300', 'skey': '2', 'ekey': '3',

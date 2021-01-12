@@ -3,6 +3,7 @@
 osd_perf_query module
 """
 
+from itertools import groupby
 from time import time
 import errno
 import prettytable
@@ -23,7 +24,8 @@ class OSDPerfQuery(MgrModule):
     COMMANDS = [
         {
             "cmd": "osd perf query add "
-                   "name=query,type=CephChoices,strings=client_id|rbd_image_id",
+                   "name=query,type=CephChoices,"
+                   "strings=client_id|rbd_image_id|all_subkeys",
             "desc": "add osd perf query",
             "perm": "w"
         },
@@ -43,22 +45,41 @@ class OSDPerfQuery(MgrModule):
 
     CLIENT_ID_QUERY = {
         'key_descriptor': [
-            {'type': 'client_id', 'regex': '^.+$'},
+            {'type': 'client_id', 'regex': '^(.+)$'},
         ],
         'performance_counter_descriptors': [
-            'write_ops', 'read_ops', 'write_bytes', 'read_bytes',
+            'bytes', 'write_ops', 'read_ops', 'write_bytes', 'read_bytes',
             'write_latency', 'read_latency',
         ],
+        'limit': {'order_by': 'bytes', 'max_count': 10},
     }
 
     RBD_IMAGE_ID_QUERY = {
         'key_descriptor': [
-            {'type': 'pool_id', 'regex': '^.+$'},
-            {'type': 'object_name', 'regex': '^rbd_data\.([^.]+)\.'},
+            {'type': 'pool_id', 'regex': '^(.+)$'},
+            {'type': 'object_name',
+             'regex': '^(?:rbd|journal)_data\.(?:([0-9]+)\.)?([^.]+)\.'},
         ],
         'performance_counter_descriptors': [
-            'write_ops', 'read_ops', 'write_bytes', 'read_bytes',
+            'bytes', 'write_ops', 'read_ops', 'write_bytes', 'read_bytes',
             'write_latency', 'read_latency',
+        ],
+        'limit': {'order_by': 'bytes', 'max_count': 10},
+    }
+
+    ALL_SUBKEYS_QUERY = {
+        'key_descriptor': [
+            {'type': 'client_id', 'regex': '^(.*)$'},
+            {'type': 'client_address', 'regex': '^(.*)$'},
+            {'type': 'pool_id', 'regex': '^(.*)$'},
+            {'type': 'namespace', 'regex': '^(.*)$'},
+            {'type': 'osd_id', 'regex': '^(.*)$'},
+            {'type': 'pg_id', 'regex': '^(.*)$'},
+            {'type': 'object_name', 'regex': '^(.*)$'},
+            {'type': 'snap_id', 'regex': '^(.*)$'},
+        ],
+        'performance_counter_descriptors': [
+            'write_ops', 'read_ops',
         ],
     }
 
@@ -68,8 +89,10 @@ class OSDPerfQuery(MgrModule):
         if cmd['prefix'] == "osd perf query add":
             if cmd['query'] == 'rbd_image_id':
                 query = self.RBD_IMAGE_ID_QUERY
-            else:
+            elif cmd['query'] == 'client_id':
                 query = self.CLIENT_ID_QUERY
+            else:
+                query = self.ALL_SUBKEYS_QUERY
             query_id = self.add_osd_perf_query(query)
             if query_id is None:
                 return -errno.EINVAL, "", "Invalid query"
@@ -92,27 +115,66 @@ class OSDPerfQuery(MgrModule):
             descriptors = query['performance_counter_descriptors']
 
             if query == self.RBD_IMAGE_ID_QUERY:
-                column_names = ["pool_id", "rbd image_id"]
+                column_names = ["POOL_ID", "RBD IMAGE ID"]
             else:
-                column_names = ["client_id"]
+                column_names = [sk['type'].upper() for sk in query['key_descriptor']]
             for d in descriptors:
                 desc = d
-                if d in ['write_bytes', 'read_bytes']:
+                if d in ['bytes']:
+                    continue
+                elif d in ['write_bytes', 'read_bytes']:
                     desc += '/sec'
                 elif d in ['write_latency', 'read_latency']:
                     desc += '(msec)'
-                column_names.append(desc)
+                column_names.append(desc.upper())
 
             table = prettytable.PrettyTable(tuple(column_names),
                                             hrules=prettytable.FRAME)
-            for c in res['counters']:
+            table.left_padding_width = 0
+            table.right_padding_width = 2
+
+            if query == self.RBD_IMAGE_ID_QUERY:
+                # typical output:
+                #  {'k': [['3'], ['', '16fe5b5a8435e']],
+                #   'c': [[1024, 0], [1, 0], ...]}
+                # pool id fixup: if the object_name regex has matched pool id
+                # use it as the image pool id
+                for c in res['counters']:
+                    if c['k'][1][0]:
+                        c['k'][0][0] = c['k'][1][0]
+                # group by (pool_id, image_id)
+                processed = []
+                res['counters'].sort(key=lambda c: [c['k'][0][0], c['k'][1][1]])
+                for key, group in groupby(res['counters'],
+                                          lambda c: [c['k'][0][0], c['k'][1][1]]):
+                    counters = [[0, 0] for x in descriptors]
+                    for c in group:
+                        for i in range(len(counters)):
+                            counters[i][0] += c['c'][i][0]
+                            counters[i][1] += c['c'][i][1]
+                    processed.append({'k' : key, 'c' : counters})
+            else:
+                # typical output:
+                #  {'k': [['client.94348']], 'c': [[1024, 0], [1, 0], ...]}
+                processed = res['counters']
+
+            max_count = len(processed)
+            if 'limit' in query:
+                if 'max_count' in query['limit']:
+                    max_count = query['limit']['max_count']
+                if 'order_by' in query['limit']:
+                    i = descriptors.index(query['limit']['order_by'])
+                    processed.sort(key=lambda x: x['c'][i][0], reverse=True)
+            for c in processed[:max_count]:
                 if query == self.RBD_IMAGE_ID_QUERY:
-                    row = [c['k'][0][0], c['k'][1][1]]
+                    row = c['k']
                 else:
-                    row = [c['k'][0][0]]
+                    row = [sk[0] for sk in c['k']]
                 counters = c['c']
                 for i in range(len(descriptors)):
-                    if descriptors[i] in ['write_bytes', 'read_bytes']:
+                    if descriptors[i] in ['bytes']:
+                        continue
+                    elif descriptors[i] in ['write_bytes', 'read_bytes']:
                         bps = counters[i][0] / (now - last_update)
                         row.append(get_human_readable(bps))
                     elif descriptors[i] in ['write_latency', 'read_latency']:

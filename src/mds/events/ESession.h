@@ -29,25 +29,29 @@ class ESession : public LogEvent {
   interval_set<inodeno_t> inos;
   version_t inotablev{0};
 
+  interval_set<inodeno_t> purge_inos;
+  
   // Client metadata stored during open
   client_metadata_t client_metadata;
 
  public:
   ESession() : LogEvent(EVENT_SESSION), open(false) { }
   ESession(const entity_inst_t& inst, bool o, version_t v,
-	   client_metadata_t &&cm) :
+	   const client_metadata_t& cm) :
     LogEvent(EVENT_SESSION),
     client_inst(inst), open(o), cmapv(v), inotablev(0),
-    client_metadata(std::move(cm)) { }
+    client_metadata(cm) { }
   ESession(const entity_inst_t& inst, bool o, version_t v,
-	   const interval_set<inodeno_t>& i, version_t iv) :
+	   interval_set<inodeno_t> i, version_t iv,
+	   interval_set<inodeno_t> _purge_inos) :
     LogEvent(EVENT_SESSION),
-    client_inst(inst), open(o), cmapv(v), inos(i), inotablev(iv) { }
+    client_inst(inst), open(o), cmapv(v), inos(std::move(i)), inotablev(iv),
+    purge_inos(std::move(_purge_inos)) {}
 
   void encode(bufferlist& bl, uint64_t features) const override;
   void decode(bufferlist::const_iterator& bl) override;
   void dump(Formatter *f) const override;
-  static void generate_test_instances(list<ESession*>& ls);
+  static void generate_test_instances(std::list<ESession*>& ls);
 
   void print(ostream& out) const override {
     if (open)

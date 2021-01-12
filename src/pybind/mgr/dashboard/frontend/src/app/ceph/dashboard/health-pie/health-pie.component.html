@@ -1,11 +1,12 @@
 <div class="chart-container">
   <canvas baseChart
           #chartCanvas
-          [datasets]="chart.dataset"
-          [chartType]="chart.chartType"
-          [options]="chart.options"
-          [labels]="chart.labels"
-          [colors]="chart.colors"
+          [datasets]="chartConfig.dataset"
+          [chartType]="chartConfig.chartType"
+          [options]="chartConfig.options"
+          [labels]="chartConfig.labels"
+          [colors]="chartConfig.colors"
+          [plugins]="doughnutChartPlugins"
           class="chart-canvas">
   </canvas>
   <div class="chartjs-tooltip"

@@ -54,10 +54,11 @@ static int call_ggate_cmd(const po::variables_map &vm,
 int get_image_or_snap_spec(const po::variables_map &vm, std::string *spec) {
   size_t arg_index = 0;
   std::string pool_name;
+  std::string nspace_name;
   std::string image_name;
   std::string snap_name;
   int r = utils::get_pool_image_snapshot_names(
-    vm, at::ARGUMENT_MODIFIER_NONE, &arg_index, &pool_name, nullptr,
+    vm, at::ARGUMENT_MODIFIER_NONE, &arg_index, &pool_name, &nspace_name,
     &image_name, &snap_name, true,
     utils::SNAPSHOT_PRESENCE_PERMITTED, utils::SPEC_VALIDATION_NONE);
   if (r < 0) {
@@ -66,6 +67,10 @@ int get_image_or_snap_spec(const po::variables_map &vm, std::string *spec) {
 
   spec->append(pool_name);
   spec->append("/");
+  if (!nspace_name.empty()) {
+    spec->append(nspace_name);
+    spec->append("/");
+  }
   spec->append(image_name);
   if (!snap_name.empty()) {
     spec->append("@");
@@ -125,12 +130,20 @@ int execute_map(const po::variables_map &vm,
   }
   args.push_back(img);
 
+  if (vm["quiesce"].as<bool>()) {
+    std::cerr << "rbd: warning: quiesce is not supported" << std::endl;
+  }
+
   if (vm["read-only"].as<bool>()) {
     args.push_back("--read-only");
   }
 
   if (vm["exclusive"].as<bool>()) {
     args.push_back("--exclusive");
+  }
+
+  if (vm.count("quiesce-hook")) {
+    std::cerr << "rbd: warning: quiesce-hook is not supported" << std::endl;
   }
 
   if (vm.count("options")) {

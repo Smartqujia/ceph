@@ -18,6 +18,7 @@ set(librbd_test
   test_MirroringWatcher.cc
   test_ObjectMap.cc
   test_Operations.cc
+  test_Trash.cc
   journal/test_Entries.cc
   journal/test_Replay.cc)
 add_library(rbd_test STATIC ${librbd_test})
@@ -42,6 +43,7 @@ target_link_libraries(rbd_test_mock PUBLIC
 set(unittest_librbd_srcs
   test_main.cc
   test_mock_fixture.cc
+  test_mock_ConfigWatcher.cc
   test_mock_DeepCopyRequest.cc
   test_mock_ExclusiveLock.cc
   test_mock_Journal.cc
@@ -49,6 +51,14 @@ set(unittest_librbd_srcs
   test_mock_ObjectMap.cc
   test_mock_TrashWatcher.cc
   test_mock_Watcher.cc
+  cache/test_mock_WriteAroundObjectDispatch.cc
+  cache/test_mock_ParentCacheObjectDispatch.cc
+  crypto/test_mock_BlockCrypto.cc
+  crypto/test_mock_CryptoContextPool.cc
+  crypto/test_mock_CryptoObjectDispatch.cc
+  crypto/test_mock_FormatRequest.cc
+  crypto/test_mock_LoadRequest.cc
+  crypto/openssl/test_DataCryptor.cc
   deep_copy/test_mock_ImageCopyRequest.cc
   deep_copy/test_mock_MetadataCopyRequest.cc
   deep_copy/test_mock_ObjectCopyRequest.cc
@@ -58,16 +68,20 @@ set(unittest_librbd_srcs
   exclusive_lock/test_mock_PreAcquireRequest.cc
   exclusive_lock/test_mock_PostAcquireRequest.cc
   exclusive_lock/test_mock_PreReleaseRequest.cc
+  image/test_mock_AttachChildRequest.cc
   image/test_mock_AttachParentRequest.cc
   image/test_mock_CloneRequest.cc
   image/test_mock_DetachChildRequest.cc
   image/test_mock_DetachParentRequest.cc
   image/test_mock_ListWatchersRequest.cc
+  image/test_mock_PreRemoveRequest.cc
   image/test_mock_RefreshRequest.cc
   image/test_mock_RemoveRequest.cc
+  image/test_mock_ValidatePoolRequest.cc
+  io/test_mock_CopyupRequest.cc
   io/test_mock_ImageRequest.cc
-  io/test_mock_ImageRequestWQ.cc
   io/test_mock_ObjectRequest.cc
+  io/test_mock_SimpleSchedulerObjectDispatch.cc
   journal/test_mock_OpenRequest.cc
   journal/test_mock_PromoteRequest.cc
   journal/test_mock_Replay.cc
@@ -77,7 +91,21 @@ set(unittest_librbd_srcs
   managed_lock/test_mock_GetLockerRequest.cc
   managed_lock/test_mock_ReacquireRequest.cc
   managed_lock/test_mock_ReleaseRequest.cc
+  migration/test_mock_FileStream.cc
+  migration/test_mock_HttpClient.cc
+  migration/test_mock_HttpStream.cc
+  migration/test_mock_RawFormat.cc
+  migration/test_mock_RawSnapshot.cc
+  migration/test_mock_S3Stream.cc
+  migration/test_mock_Utils.cc
+  mirror/snapshot/test_mock_CreateNonPrimaryRequest.cc
+  mirror/snapshot/test_mock_CreatePrimaryRequest.cc
+  mirror/snapshot/test_mock_ImageMeta.cc
+  mirror/snapshot/test_mock_PromoteRequest.cc
+  mirror/snapshot/test_mock_UnlinkPeerRequest.cc
+  mirror/snapshot/test_mock_Utils.cc
   mirror/test_mock_DisableRequest.cc
+  object_map/test_mock_DiffRequest.cc
   object_map/test_mock_InvalidateRequest.cc
   object_map/test_mock_LockRequest.cc
   object_map/test_mock_RefreshRequest.cc
@@ -98,32 +126,64 @@ set(unittest_librbd_srcs
   operation/test_mock_SnapshotUnprotectRequest.cc
   operation/test_mock_TrimRequest.cc
   trash/test_mock_MoveRequest.cc
+  trash/test_mock_RemoveRequest.cc
   watcher/test_mock_RewatchRequest.cc
   )
+
+if(WITH_RBD_RWL OR WITH_RBD_SSD_CACHE)
+   set(unittest_librbd_srcs
+     ${unittest_librbd_srcs}
+     cache/pwl/test_WriteLogMap.cc)
+   if(WITH_RBD_RWL)
+     set(unittest_librbd_srcs
+       ${unittest_librbd_srcs}
+       cache/pwl/test_mock_ReplicatedWriteLog.cc)
+   endif()
+   if(WITH_RBD_SSD_CACHE)
+     set(unittest_librbd_srcs
+       ${unittest_librbd_srcs}
+       cache/pwl/test_mock_SSDWriteLog.cc)
+   endif()
+endif()
+
+if(LINUX AND HAVE_LIBCRYPTSETUP)
+  list(APPEND unittest_librbd_srcs
+          crypto/luks/test_mock_FormatRequest.cc
+          crypto/luks/test_mock_LoadRequest.cc)
+endif()
+
 add_executable(unittest_librbd
   ${unittest_librbd_srcs}
   $<TARGET_OBJECTS:common_texttable_obj>)
 target_compile_definitions(unittest_librbd PRIVATE "TEST_LIBRBD_INTERNALS")
-target_link_libraries(unittest_librbd
-  cls_rbd
-  cls_rbd_client
-  cls_lock
-  cls_lock_client
-  journal
-  journal_test_mock
+add_dependencies(unittest_librbd
   cls_journal
-  cls_journal_client
-  rados_test_stub
-  librados
+  cls_lock
+  cls_rbd)
+target_link_libraries(unittest_librbd
   rbd_test
-  rbd_test_mock
   rbd_api
   rbd_internal
+  rbd_test_mock
+  journal
+  journal_test_mock
+  cls_rbd_client
+  cls_lock_client
+  cls_journal_client
   rbd_types
+  rados_test_stub
+  librados
+  ceph_immutable_object_cache_lib
   osdc
   ceph-common
   global
+  OpenSSL::SSL
   ${UNITTEST_LIBS})
+
+if(WITH_RBD_RWL OR WITH_RBD_SSD_CACHE)
+  target_link_libraries(unittest_librbd
+    librbd_plugin_pwl_cache)
+endif()
 
 add_executable(ceph_test_librbd
   test_main.cc
@@ -136,25 +196,11 @@ target_link_libraries(ceph_test_librbd
   journal
   cls_journal_client
   cls_rbd_client
+  libneorados
   librados
-  librados-cxx
   ${UNITTEST_LIBS}
   radostest)
 target_compile_definitions(ceph_test_librbd PRIVATE "TEST_LIBRBD_INTERNALS")
-
-add_executable(ceph_test_librbd_api
-  test_support.cc
-  test_librbd.cc
-  test_main.cc
-  $<TARGET_OBJECTS:common_texttable_obj>)
-target_link_libraries(ceph_test_librbd_api
-  ceph-common
-  radostest
-  radostest-cxx
-  librbd
-  librados
-  librados-cxx
-  ${UNITTEST_LIBS})
 
 add_executable(ceph_test_librbd_fsx
   fsx.cc
@@ -163,7 +209,6 @@ add_executable(ceph_test_librbd_fsx
 target_link_libraries(ceph_test_librbd_fsx
   librbd
   librados
-  librados-cxx
   journal
   global
   m
@@ -181,5 +226,4 @@ install(TARGETS
 
 install(TARGETS
   ceph_test_librbd
-  ceph_test_librbd_api
   DESTINATION ${CMAKE_INSTALL_BINDIR})

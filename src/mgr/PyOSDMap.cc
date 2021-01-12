@@ -35,12 +35,12 @@ typedef struct {
 
 static PyObject *osdmap_get_epoch(BasePyOSDMap *self, PyObject *obj)
 {
-  return PyInt_FromLong(self->osdmap->get_epoch());
+  return PyLong_FromLong(self->osdmap->get_epoch());
 }
 
 static PyObject *osdmap_get_crush_version(BasePyOSDMap* self, PyObject *obj)
 {
-  return PyInt_FromLong(self->osdmap->get_crush_version());
+  return PyLong_FromLong(self->osdmap->get_crush_version());
 }
 
 static PyObject *osdmap_dump(BasePyOSDMap* self, PyObject *obj)
@@ -114,9 +114,9 @@ static PyObject *osdmap_calc_pg_upmaps(BasePyOSDMap* self, PyObject *args)
 {
   PyObject *pool_list;
   BasePyOSDMapIncremental *incobj;
-  double max_deviation = 0;
+  int max_deviation = 0;
   int max_iterations = 0;
-  if (!PyArg_ParseTuple(args, "OdiO:calc_pg_upmaps",
+  if (!PyArg_ParseTuple(args, "OiiO:calc_pg_upmaps",
 			&incobj, &max_deviation,
 			&max_iterations, &pool_list)) {
     return nullptr;
@@ -128,14 +128,14 @@ static PyObject *osdmap_calc_pg_upmaps(BasePyOSDMap* self, PyObject *args)
   set<int64_t> pools;
   for (auto i = 0; i < PyList_Size(pool_list); ++i) {
     PyObject *pool_name = PyList_GET_ITEM(pool_list, i);
-    if (!PyString_Check(pool_name)) {
+    if (!PyUnicode_Check(pool_name)) {
       derr << __func__ << " " << pool_name << " not a string" << dendl;
       return nullptr;
     }
     auto pool_id = self->osdmap->lookup_pg_pool_name(
-      PyString_AsString(pool_name));
+      PyUnicode_AsUTF8(pool_name));
     if (pool_id < 0) {
-      derr << __func__ << " pool '" << PyString_AsString(pool_name)
+      derr << __func__ << " pool '" << PyUnicode_AsUTF8(pool_name)
            << "' does not exist" << dendl;
       return nullptr;
     }
@@ -147,13 +147,15 @@ static PyObject *osdmap_calc_pg_upmaps(BasePyOSDMap* self, PyObject *args)
 	   << " max_iterations " << max_iterations
 	   << " pools " << pools
 	   << dendl;
+  PyThreadState *tstate = PyEval_SaveThread();
   int r = self->osdmap->calc_pg_upmaps(g_ceph_context,
 				 max_deviation,
 				 max_iterations,
 				 pools,
 				 incobj->inc);
+  PyEval_RestoreThread(tstate);
   dout(10) << __func__ << " r = " << r << dendl;
-  return PyInt_FromLong(r);
+  return PyLong_FromLong(r);
 }
 
 static PyObject *osdmap_map_pool_pgs_up(BasePyOSDMap* self, PyObject *args)
@@ -253,6 +255,23 @@ static PyObject *osdmap_pg_to_up_acting_osds(BasePyOSDMap *self, PyObject *args)
   return f.get();
 }
 
+static PyObject *osdmap_pool_raw_used_rate(BasePyOSDMap *self, PyObject *args)
+{
+  int pool_id = 0;
+  if (!PyArg_ParseTuple(args, "i:pool_raw_used_rate",
+			&pool_id)) {
+    return nullptr;
+  }
+
+  if (!self->osdmap->have_pg_pool(pool_id)) {
+    return nullptr;
+  }
+
+  float rate = self->osdmap->pool_raw_used_rate(pool_id);
+
+  return PyFloat_FromDouble(rate);
+}
+
 
 PyMethodDef BasePyOSDMap_methods[] = {
   {"_get_epoch", (PyCFunction)osdmap_get_epoch, METH_NOARGS, "Get OSDMap epoch"},
@@ -272,6 +291,8 @@ PyMethodDef BasePyOSDMap_methods[] = {
    "Calculate up set mappings for all PGs in a pool"},
   {"_pg_to_up_acting_osds", (PyCFunction)osdmap_pg_to_up_acting_osds, METH_VARARGS,
     "Calculate up+acting OSDs for a PG ID"},
+  {"_pool_raw_used_rate", (PyCFunction)osdmap_pool_raw_used_rate, METH_VARARGS,
+   "Get raw space to logical space ratio"},
   {NULL, NULL, 0, NULL}
 };
 
@@ -356,7 +377,7 @@ BasePyOSDMapIncremental_dealloc(BasePyOSDMapIncremental *self)
 static PyObject *osdmap_inc_get_epoch(BasePyOSDMapIncremental *self,
     PyObject *obj)
 {
-  return PyInt_FromLong(self->inc->epoch);
+  return PyLong_FromLong(self->inc->epoch);
 }
 
 static PyObject *osdmap_inc_dump(BasePyOSDMapIncremental *self,
@@ -539,7 +560,7 @@ static PyObject *crush_get_item_name(BasePyCRUSH *self, PyObject *args)
   if (!self->crush->item_exists(item)) {
     Py_RETURN_NONE;
   }
-  return PyString_FromString(self->crush->get_item_name(item));
+  return PyUnicode_FromString(self->crush->get_item_name(item));
 }
 
 static PyObject *crush_get_item_weight(BasePyCRUSH *self, PyObject *args)

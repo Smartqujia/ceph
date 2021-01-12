@@ -1,11 +1,13 @@
 import { Component, EventEmitter, Output } from '@angular/core';
 import { Validators } from '@angular/forms';
 
-import * as _ from 'lodash';
-import { BsModalRef } from 'ngx-bootstrap/modal';
+import { NgbActiveModal } from '@ng-bootstrap/ng-bootstrap';
+import _ from 'lodash';
 
-import { CdFormBuilder } from '../../../shared/forms/cd-form-builder';
-import { CdFormGroup } from '../../../shared/forms/cd-form-group';
+import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
+import { CdFormBuilder } from '~/app/shared/forms/cd-form-builder';
+import { CdFormGroup } from '~/app/shared/forms/cd-form-group';
+import { RgwUserCapabilities } from '../models/rgw-user-capabilities';
 import { RgwUserCapability } from '../models/rgw-user-capability';
 
 @Component({
@@ -24,8 +26,15 @@ export class RgwUserCapabilityModalComponent {
   formGroup: CdFormGroup;
   editing = true;
   types: string[] = [];
+  resource: string;
+  action: string;
 
-  constructor(private formBuilder: CdFormBuilder, public bsModalRef: BsModalRef) {
+  constructor(
+    private formBuilder: CdFormBuilder,
+    public activeModal: NgbActiveModal,
+    public actionLabels: ActionLabelsI18n
+  ) {
+    this.resource = $localize`capability`;
     this.createForm();
   }
 
@@ -44,6 +53,7 @@ export class RgwUserCapabilityModalComponent {
    */
   setEditing(editing: boolean = true) {
     this.editing = editing;
+    this.action = this.editing ? this.actionLabels.EDIT : this.actionLabels.ADD;
   }
 
   /**
@@ -62,12 +72,12 @@ export class RgwUserCapabilityModalComponent {
   setCapabilities(capabilities: RgwUserCapability[]) {
     // Parse the configured capabilities to get a list of types that
     // should be displayed.
-    const usedTypes = [];
+    const usedTypes: string[] = [];
     capabilities.forEach((capability) => {
       usedTypes.push(capability.type);
     });
     this.types = [];
-    ['users', 'buckets', 'metadata', 'usage', 'zone'].forEach((type) => {
+    RgwUserCapabilities.getAll().forEach((type) => {
       if (_.indexOf(usedTypes, type) === -1) {
         this.types.push(type);
       }
@@ -77,6 +87,6 @@ export class RgwUserCapabilityModalComponent {
   onSubmit() {
     const capability: RgwUserCapability = this.formGroup.value;
     this.submitAction.emit(capability);
-    this.bsModalRef.hide();
+    this.activeModal.close();
   }
 }

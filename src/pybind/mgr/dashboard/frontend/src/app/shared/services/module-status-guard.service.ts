@@ -1,17 +1,11 @@
 import { HttpClient } from '@angular/common/http';
 import { Injectable } from '@angular/core';
-import {
-  ActivatedRouteSnapshot,
-  CanActivate,
-  CanActivateChild,
-  Router,
-  RouterStateSnapshot
-} from '@angular/router';
+import { ActivatedRouteSnapshot, CanActivate, CanActivateChild, Router } from '@angular/router';
 
 import { of as observableOf } from 'rxjs';
 import { catchError, map } from 'rxjs/operators';
 
-import { ServicesModule } from './services.module';
+import { Icons } from '../enum/icons.enum';
 
 /**
  * This service checks if a route can be activated by executing a
@@ -39,25 +33,39 @@ import { ServicesModule } from './services.module';
  * ...
  */
 @Injectable({
-  providedIn: ServicesModule
+  providedIn: 'root'
 })
 export class ModuleStatusGuardService implements CanActivate, CanActivateChild {
+  // TODO: Hotfix - remove ALLOWLIST'ing when a generic ErrorComponent is implemented
+  static readonly ALLOWLIST: string[] = ['501'];
+
   constructor(private http: HttpClient, private router: Router) {}
 
-  canActivate(route: ActivatedRouteSnapshot, state: RouterStateSnapshot) {
+  canActivate(route: ActivatedRouteSnapshot) {
     return this.doCheck(route);
   }
 
-  canActivateChild(childRoute: ActivatedRouteSnapshot, state: RouterStateSnapshot) {
+  canActivateChild(childRoute: ActivatedRouteSnapshot) {
     return this.doCheck(childRoute);
   }
 
   private doCheck(route: ActivatedRouteSnapshot) {
+    if (route.url.length > 0 && ModuleStatusGuardService.ALLOWLIST.includes(route.url[0].path)) {
+      return observableOf(true);
+    }
     const config = route.data['moduleStatusGuardConfig'];
-    return this.http.get(`/api/${config.apiPath}/status`).pipe(
+    return this.http.get(`api/${config.apiPath}/status`).pipe(
       map((resp: any) => {
         if (!resp.available) {
-          this.router.navigate([config.redirectTo, resp.message || '']);
+          this.router.navigate([config.redirectTo || ''], {
+            state: {
+              header: config.header,
+              message: resp.message,
+              section: config.section,
+              section_info: config.section_info,
+              icon: Icons.wrench
+            }
+          });
         }
         return resp.available;
       }),

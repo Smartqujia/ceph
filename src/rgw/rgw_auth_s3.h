@@ -1,5 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// vim: ts=8 sw=2 smarttab ft=cpp
 
 #ifndef CEPH_RGW_AUTH_S3_H
 #define CEPH_RGW_AUTH_S3_H
@@ -7,17 +7,15 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <tuple>
 
 #include <boost/algorithm/string.hpp>
 #include <boost/container/static_vector.hpp>
-#include <boost/utility/string_ref.hpp>
-#include <boost/utility/string_view.hpp>
 
 #include "common/sstring.hh"
 #include "rgw_common.h"
 #include "rgw_rest_s3.h"
-
 #include "rgw_auth.h"
 #include "rgw_auth_filters.h"
 #include "rgw_auth_keystone.h"
@@ -34,9 +32,11 @@ bool is_time_skew_ok(time_t t);
 
 class STSAuthStrategy : public rgw::auth::Strategy,
                         public rgw::auth::RemoteApplier::Factory,
-                        public rgw::auth::LocalApplier::Factory {
+                        public rgw::auth::LocalApplier::Factory,
+                        public rgw::auth::RoleApplier::Factory {
   typedef rgw::auth::IdentityApplier::aplptr_t aplptr_t;
-  RGWRados* const store;
+  RGWCtl* const ctl;
+  rgw::auth::ImplicitTenants& implicit_tenant_context;
 
   STSEngine  sts_engine;
 
@@ -45,9 +45,10 @@ class STSAuthStrategy : public rgw::auth::Strategy,
                              rgw::auth::RemoteApplier::acl_strategy_t&& acl_alg,
                              const rgw::auth::RemoteApplier::AuthInfo &info
                             ) const override {
-    auto apl = rgw::auth::add_sysreq(cct, store, s,
-      rgw::auth::RemoteApplier(cct, store, std::move(acl_alg), info,
-                               cct->_conf->rgw_keystone_implicit_tenants));
+    auto apl = rgw::auth::add_sysreq(cct, ctl, s,
+      rgw::auth::RemoteApplier(cct, ctl, std::move(acl_alg), info,
+			       implicit_tenant_context,
+                               rgw::auth::ImplicitTenants::IMPLICIT_TENANTS_S3));
     return aplptr_t(new decltype(apl)(std::move(apl)));
   }
 
@@ -55,21 +56,36 @@ class STSAuthStrategy : public rgw::auth::Strategy,
                             const req_state* const s,
                             const RGWUserInfo& user_info,
                             const std::string& subuser,
-                            const boost::optional<vector<std::string> >& role_policies,
                             const boost::optional<uint32_t>& perm_mask) const override {
-    auto apl = rgw::auth::add_sysreq(cct, store, s,
-      rgw::auth::LocalApplier(cct, user_info, subuser, role_policies, perm_mask));
+    auto apl = rgw::auth::add_sysreq(cct, ctl, s,
+      rgw::auth::LocalApplier(cct, user_info, subuser, perm_mask));
+    return aplptr_t(new decltype(apl)(std::move(apl)));
+  }
+
+  aplptr_t create_apl_role(CephContext* const cct,
+                            const req_state* const s,
+                            const rgw::auth::RoleApplier::Role& role,
+                            const rgw_user& user_id,
+                            const std::string& token_policy,
+                            const std::string& role_session_name,
+                            const std::vector<string>& token_claims,
+                            const std::string& token_issued_at) const override {
+    auto apl = rgw::auth::add_sysreq(cct, ctl, s,
+      rgw::auth::RoleApplier(cct, role, user_id, token_policy, role_session_name, token_claims, token_issued_at));
     return aplptr_t(new decltype(apl)(std::move(apl)));
   }
 
 public:
   STSAuthStrategy(CephContext* const cct,
-                       RGWRados* const store,
+                       RGWCtl* const ctl,
+                       rgw::auth::ImplicitTenants& implicit_tenant_context,
                        AWSEngine::VersionAbstractor* const ver_abstractor)
-    : store(store),
-      sts_engine(cct, store, *ver_abstractor,
+    : ctl(ctl),
+      implicit_tenant_context(implicit_tenant_context),
+      sts_engine(cct, ctl, *ver_abstractor,
                   static_cast<rgw::auth::LocalApplier::Factory*>(this),
-                  static_cast<rgw::auth::RemoteApplier::Factory*>(this)) {
+                  static_cast<rgw::auth::RemoteApplier::Factory*>(this),
+                  static_cast<rgw::auth::RoleApplier::Factory*>(this)) {
       if (cct->_conf->rgw_s3_auth_use_sts) {
         add_engine(Control::SUFFICIENT, sts_engine);
       }
@@ -83,10 +99,12 @@ public:
 class ExternalAuthStrategy : public rgw::auth::Strategy,
                              public rgw::auth::RemoteApplier::Factory {
   typedef rgw::auth::IdentityApplier::aplptr_t aplptr_t;
-  RGWRados* const store;
+  RGWCtl* const ctl;
+  rgw::auth::ImplicitTenants& implicit_tenant_context;
 
   using keystone_config_t = rgw::keystone::CephCtxConfig;
   using keystone_cache_t = rgw::keystone::TokenCache;
+  using secret_cache_t = rgw::auth::keystone::SecretCache;
   using EC2Engine = rgw::auth::keystone::EC2Engine;
 
   boost::optional <EC2Engine> keystone_engine;
@@ -97,19 +115,22 @@ class ExternalAuthStrategy : public rgw::auth::Strategy,
                              rgw::auth::RemoteApplier::acl_strategy_t&& acl_alg,
                              const rgw::auth::RemoteApplier::AuthInfo &info
                             ) const override {
-    auto apl = rgw::auth::add_sysreq(cct, store, s,
-      rgw::auth::RemoteApplier(cct, store, std::move(acl_alg), info,
-                               cct->_conf->rgw_keystone_implicit_tenants));
+    auto apl = rgw::auth::add_sysreq(cct, ctl, s,
+      rgw::auth::RemoteApplier(cct, ctl, std::move(acl_alg), info,
+                               implicit_tenant_context,
+                               rgw::auth::ImplicitTenants::IMPLICIT_TENANTS_S3));
     /* TODO(rzarzynski): replace with static_ptr. */
     return aplptr_t(new decltype(apl)(std::move(apl)));
   }
 
 public:
   ExternalAuthStrategy(CephContext* const cct,
-                       RGWRados* const store,
+                       RGWCtl* const ctl,
+                       rgw::auth::ImplicitTenants& implicit_tenant_context,
                        AWSEngine::VersionAbstractor* const ver_abstractor)
-    : store(store),
-      ldap_engine(cct, store, *ver_abstractor,
+    : ctl(ctl),
+      implicit_tenant_context(implicit_tenant_context),
+      ldap_engine(cct, ctl, *ver_abstractor,
                   static_cast<rgw::auth::RemoteApplier::Factory*>(this)) {
 
     if (cct->_conf->rgw_s3_auth_use_keystone &&
@@ -118,13 +139,13 @@ public:
       keystone_engine.emplace(cct, ver_abstractor,
                               static_cast<rgw::auth::RemoteApplier::Factory*>(this),
                               keystone_config_t::get_instance(),
-                              keystone_cache_t::get_instance<keystone_config_t>());
+                              keystone_cache_t::get_instance<keystone_config_t>(),
+			      secret_cache_t::get_instance());
       add_engine(Control::SUFFICIENT, *keystone_engine);
 
     }
 
-    if (cct->_conf->rgw_s3_auth_use_ldap &&
-        ! cct->_conf->rgw_ldap_uri.empty()) {
+    if (ldap_engine.valid()) {
       add_engine(Control::SUFFICIENT, ldap_engine);
     }
   }
@@ -145,7 +166,7 @@ class AWSAuthStrategy : public rgw::auth::Strategy,
                                 AbstractorT>::value,
                 "AbstractorT must be a subclass of rgw::auth::s3::VersionAbstractor");
 
-  RGWRados* const store;
+  RGWCtl* const ctl;
   AbstractorT ver_abstractor;
 
   S3AnonymousEngine anonymous_engine;
@@ -157,10 +178,9 @@ class AWSAuthStrategy : public rgw::auth::Strategy,
                             const req_state* const s,
                             const RGWUserInfo& user_info,
                             const std::string& subuser,
-                            const boost::optional<vector<std::string> >& role_policies,
                             const boost::optional<uint32_t>& perm_mask) const override {
-    auto apl = rgw::auth::add_sysreq(cct, store, s,
-      rgw::auth::LocalApplier(cct, user_info, subuser, role_policies, perm_mask));
+    auto apl = rgw::auth::add_sysreq(cct, ctl, s,
+      rgw::auth::LocalApplier(cct, user_info, subuser, perm_mask));
     /* TODO(rzarzynski): replace with static_ptr. */
     return aplptr_t(new decltype(apl)(std::move(apl)));
   }
@@ -203,14 +223,15 @@ public:
   }
 
   AWSAuthStrategy(CephContext* const cct,
-                  RGWRados* const store)
-    : store(store),
+                  rgw::auth::ImplicitTenants& implicit_tenant_context,
+                  RGWCtl* const ctl)
+    : ctl(ctl),
       ver_abstractor(cct),
       anonymous_engine(cct,
                        static_cast<rgw::auth::LocalApplier::Factory*>(this)),
-      external_engines(cct, store, &ver_abstractor),
-      sts_engine(cct, store, &ver_abstractor),
-      local_engine(cct, store, ver_abstractor,
+      external_engines(cct, ctl, implicit_tenant_context, &ver_abstractor),
+      sts_engine(cct, ctl, implicit_tenant_context, &ver_abstractor),
+      local_engine(cct, ctl, ver_abstractor,
                    static_cast<rgw::auth::LocalApplier::Factory*>(this)) {
     /* The anonymous auth. */
     if (AllowAnonAccessT) {
@@ -247,13 +268,12 @@ class AWSv4ComplMulti : public rgw::auth::Completer,
                         public rgw::io::DecoratedRestfulClient<rgw::io::RestfulClient*>,
                         public std::enable_shared_from_this<AWSv4ComplMulti> {
   using io_base_t = rgw::io::DecoratedRestfulClient<rgw::io::RestfulClient*>;
-  using signing_key_t = std::array<unsigned char,
-                                   CEPH_CRYPTO_HMACSHA256_DIGESTSIZE>;
+  using signing_key_t = sha256_digest_t;
 
   CephContext* const cct;
 
-  const boost::string_view date;
-  const boost::string_view credential_scope;
+  const std::string_view date;
+  const std::string_view credential_scope;
   const signing_key_t signing_key;
 
   class ChunkMeta {
@@ -263,14 +283,14 @@ class AWSv4ComplMulti : public rgw::auth::Completer,
 
     ChunkMeta(const size_t data_starts_in_stream,
               const size_t data_length,
-              const boost::string_ref signature)
+              const std::string_view signature)
       : data_offset_in_stream(data_starts_in_stream),
         data_length(data_length),
-        signature(signature.to_string()) {
+        signature(std::string(signature)) {
     }
 
-    explicit ChunkMeta(const boost::string_view& signature)
-      : signature(signature.to_string()) {
+    explicit ChunkMeta(const std::string_view& signature)
+      : signature(std::string(signature)) {
     }
 
   public:
@@ -296,7 +316,7 @@ class AWSv4ComplMulti : public rgw::auth::Completer,
 
     /* Factory: create an object representing metadata of first, initial chunk
      * in a stream. */
-    static ChunkMeta create_first(const boost::string_view& seed_signature) {
+    static ChunkMeta create_first(const std::string_view& seed_signature) {
       return ChunkMeta(seed_signature);
     }
 
@@ -321,9 +341,9 @@ public:
   /* We need the constructor to be public because of the std::make_shared that
    * is employed by the create() method. */
   AWSv4ComplMulti(const req_state* const s,
-                  boost::string_view date,
-                  boost::string_view credential_scope,
-                  boost::string_view seed_signature,
+                  std::string_view date,
+                  std::string_view credential_scope,
+                  std::string_view seed_signature,
                   const signing_key_t& signing_key)
     : io_base_t(nullptr),
       cct(s->cct),
@@ -353,9 +373,9 @@ public:
 
   /* Factories. */
   static cmplptr_t create(const req_state* s,
-                          boost::string_view date,
-                          boost::string_view credential_scope,
-                          boost::string_view seed_signature,
+                          std::string_view date,
+                          std::string_view credential_scope,
+                          std::string_view seed_signature,
                           const boost::optional<std::string>& secret_key);
 
 };
@@ -403,7 +423,8 @@ void rgw_create_s3_canonical_header(
   const char *content_md5,
   const char *content_type,
   const char *date,
-  const std::map<std::string, std::string>& meta_map,
+  const meta_map_t& meta_map,
+  const meta_map_t& qs_map,
   const char *request_uri,
   const std::map<std::string, std::string>& sub_resources,
   std::string& dest_str);
@@ -435,14 +456,14 @@ static constexpr char AWS4_UNSIGNED_PAYLOAD_HASH[] = "UNSIGNED-PAYLOAD";
 static constexpr char AWS4_STREAMING_PAYLOAD_HASH[] = \
   "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 
-int parse_credentials(const req_info& info,                     /* in */
-                      boost::string_view& access_key_id,        /* out */
-                      boost::string_view& credential_scope,     /* out */
-                      boost::string_view& signedheaders,        /* out */
-                      boost::string_view& signature,            /* out */
-                      boost::string_view& date,                 /* out */
-                      boost::string_view& session_token,        /* out */
-                      const bool using_qs);                     /* in */
+int parse_v4_credentials(const req_info& info,                     /* in */
+			 std::string_view& access_key_id,        /* out */
+			 std::string_view& credential_scope,     /* out */
+			 std::string_view& signedheaders,        /* out */
+			 std::string_view& signature,            /* out */
+			 std::string_view& date,                 /* out */
+			 std::string_view& session_token,        /* out */
+			 const bool using_qs);                     /* in */
 
 static inline bool char_needs_aws4_escaping(const char c, bool encode_slash)
 {
@@ -481,7 +502,7 @@ static inline std::string aws4_uri_encode(const std::string& src, bool encode_sl
   return result;
 }
 
-static inline std::string aws4_uri_recode(const boost::string_view& src, bool encode_slash)
+static inline std::string aws4_uri_recode(const std::string_view& src, bool encode_slash)
 {
   std::string decoded = url_decode(src);
   return aws4_uri_encode(decoded, encode_slash);
@@ -501,6 +522,14 @@ static inline std::string get_v4_canonical_uri(const req_info& info) {
   }
 
   return canonical_uri;
+}
+
+static inline const string calc_v4_payload_hash(const string& payload)
+{
+  ceph::crypto::SHA256* sha256_hash = calc_hash_sha256_open_stream();
+  calc_hash_sha256_update_stream(sha256_hash, payload.c_str(), payload.length());
+  const auto payload_hash = calc_hash_sha256_close_stream(&sha256_hash);
+  return payload_hash;
 }
 
 static inline const char* get_v4_exp_payload_hash(const req_info& info)
@@ -553,30 +582,30 @@ std::string get_v4_canonical_qs(const req_info& info, bool using_qs);
 
 boost::optional<std::string>
 get_v4_canonical_headers(const req_info& info,
-                         const boost::string_view& signedheaders,
+                         const std::string_view& signedheaders,
                          bool using_qs,
                          bool force_boto2_compat);
 
 extern sha256_digest_t
 get_v4_canon_req_hash(CephContext* cct,
-                      const boost::string_view& http_verb,
+                      const std::string_view& http_verb,
                       const std::string& canonical_uri,
                       const std::string& canonical_qs,
                       const std::string& canonical_hdrs,
-                      const boost::string_view& signed_hdrs,
-                      const boost::string_view& request_payload_hash);
+                      const std::string_view& signed_hdrs,
+                      const std::string_view& request_payload_hash);
 
 AWSEngine::VersionAbstractor::string_to_sign_t
 get_v4_string_to_sign(CephContext* cct,
-                      const boost::string_view& algorithm,
-                      const boost::string_view& request_date,
-                      const boost::string_view& credential_scope,
+                      const std::string_view& algorithm,
+                      const std::string_view& request_date,
+                      const std::string_view& credential_scope,
                       const sha256_digest_t& canonreq_hash);
 
 extern AWSEngine::VersionAbstractor::server_signature_t
-get_v4_signature(const boost::string_view& credential_scope,
+get_v4_signature(const std::string_view& credential_scope,
                  CephContext* const cct,
-                 const boost::string_view& secret_key,
+                 const std::string_view& secret_key,
                  const AWSEngine::VersionAbstractor::string_to_sign_t& string_to_sign);
 
 extern AWSEngine::VersionAbstractor::server_signature_t

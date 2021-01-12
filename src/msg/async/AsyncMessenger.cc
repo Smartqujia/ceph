@@ -32,11 +32,11 @@
 #define dout_subsys ceph_subsys_ms
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, this)
-static ostream& _prefix(std::ostream *_dout, AsyncMessenger *m) {
+static std::ostream& _prefix(std::ostream *_dout, AsyncMessenger *m) {
   return *_dout << "-- " << m->get_myaddrs() << " ";
 }
 
-static ostream& _prefix(std::ostream *_dout, Processor *p) {
+static std::ostream& _prefix(std::ostream *_dout, Processor *p) {
   return *_dout << " Processor -- ";
 }
 
@@ -60,7 +60,7 @@ Processor::Processor(AsyncMessenger *r, Worker *w, CephContext *c)
     listen_handler(new C_processor_accept(this)) {}
 
 int Processor::bind(const entity_addrvec_t &bind_addrs,
-		    const set<int>& avoid_ports,
+		    const std::set<int>& avoid_ports,
 		    entity_addrvec_t* bound_addrs)
 {
   const auto& conf = msgr->cct->_conf;
@@ -88,9 +88,10 @@ int Processor::bind(const entity_addrvec_t &bind_addrs,
       }
 
       if (listen_addr.get_port()) {
-	worker->center.submit_to(worker->center.get_id(),
-				 [this, k, &listen_addr, &opts, &r]() {
-	    r = worker->listen(listen_addr, opts, &listen_sockets[k]);
+	worker->center.submit_to(
+	  worker->center.get_id(),
+	  [this, k, &listen_addr, &opts, &r]() {
+	    r = worker->listen(listen_addr, k, opts, &listen_sockets[k]);
 	  }, false);
 	if (r < 0) {
 	  lderr(msgr->cct) << __func__ << " unable to bind to " << listen_addr
@@ -106,9 +107,10 @@ int Processor::bind(const entity_addrvec_t &bind_addrs,
 	    continue;
 
 	  listen_addr.set_port(port);
-	  worker->center.submit_to(worker->center.get_id(),
-				   [this, k, &listen_addr, &opts, &r]() {
-	      r = worker->listen(listen_addr, opts, &listen_sockets[k]);
+	  worker->center.submit_to(
+	    worker->center.get_id(),
+	    [this, k, &listen_addr, &opts, &r]() {
+	      r = worker->listen(listen_addr, k, opts, &listen_sockets[k]);
 	    }, false);
 	  if (r == 0)
 	    break;
@@ -153,9 +155,15 @@ void Processor::start()
 
   // start thread
   worker->center.submit_to(worker->center.get_id(), [this]() {
-      for (auto& l : listen_sockets) {
-	if (l) {
-	  worker->center.create_file_event(l.fd(), EVENT_READABLE,
+      for (auto& listen_socket : listen_sockets) {
+	if (listen_socket) {
+          if (listen_socket.fd() == -1) {
+            ldout(msgr->cct, 1) << __func__ 
+                << " Error: processor restart after listen_socket.fd closed. " 
+                << this << dendl;
+            return;
+          }
+	  worker->center.create_file_event(listen_socket.fd(), EVENT_READABLE,
 					   listen_handler); }
       }
     }, false);
@@ -186,10 +194,14 @@ void Processor::accept()
 	ldout(msgr->cct, 10) << __func__ << " accepted incoming on sd "
 			     << cli_socket.fd() << dendl;
 
-	msgr->add_accept(w, std::move(cli_socket), addr);
+	msgr->add_accept(
+	  w, std::move(cli_socket),
+	  msgr->get_myaddrs().v[listen_socket.get_addr_slot()],
+	  addr);
 	accept_error_num = 0;
 	continue;
       } else {
+	--w->references;
 	if (r == -EINTR) {
 	  continue;
 	} else if (r == -EAGAIN) {
@@ -266,13 +278,10 @@ class C_handle_reap : public EventCallback {
  */
 
 AsyncMessenger::AsyncMessenger(CephContext *cct, entity_name_t name,
-                               const std::string &type, string mname, uint64_t _nonce)
-  : SimplePolicyMessenger(cct, name,mname, _nonce),
+                               const std::string &type, std::string mname, uint64_t _nonce)
+  : SimplePolicyMessenger(cct, name),
     dispatch_queue(cct, this, mname),
-    lock("AsyncMessenger::lock"),
-    nonce(_nonce), need_addr(true), did_bind(false),
-    global_seq(0), deleted_lock("AsyncMessenger::deleted_lock"),
-    cluster_protocol(0), stopped(true)
+    nonce(_nonce)
 {
   std::string transport_type = "posix";
   if (type.find("rdma") != std::string::npos)
@@ -286,7 +295,7 @@ AsyncMessenger::AsyncMessenger(CephContext *cct, entity_name_t name,
   stack = single->stack.get();
   stack->start();
   local_worker = stack->get_worker();
-  local_connection = new AsyncConnection(cct, this, &dispatch_queue,
+  local_connection = ceph::make_ref<AsyncConnection>(cct, this, &dispatch_queue,
 					 local_worker, true, true);
   init_local_connection();
   reap_handler = new C_handle_reap(this);
@@ -305,7 +314,6 @@ AsyncMessenger::~AsyncMessenger()
 {
   delete reap_handler;
   ceph_assert(!did_bind); // either we didn't bind or we shut down the Processor
-  local_connection->mark_down();
   for (auto &&p : processors)
     delete p;
 }
@@ -323,7 +331,7 @@ void AsyncMessenger::ready()
     }
   }
 
-  Mutex::Locker l(lock);
+  std::lock_guard l{lock};
   for (auto &&p : processors)
     p->start();
   dispatch_queue.start();
@@ -338,12 +346,13 @@ int AsyncMessenger::shutdown()
     p->stop();
   mark_down_all();
   // break ref cycles on the loopback connection
-  local_connection->set_priv(NULL);
+  local_connection->clear_priv();
+  local_connection->mark_down();
   did_bind = false;
-  lock.Lock();
-  stop_cond.Signal();
+  lock.lock();
+  stop_cond.notify_all();
   stopped = true;
-  lock.Unlock();
+  lock.unlock();
   stack->drain();
   return 0;
 }
@@ -367,11 +376,11 @@ int AsyncMessenger::bind(const entity_addr_t &bind_addr)
 
 int AsyncMessenger::bindv(const entity_addrvec_t &bind_addrs)
 {
-  lock.Lock();
+  lock.lock();
 
   if (!pending_bind && started) {
     ldout(cct,10) << __func__ << " already started" << dendl;
-    lock.Unlock();
+    lock.unlock();
     return -1;
   }
 
@@ -381,14 +390,14 @@ int AsyncMessenger::bindv(const entity_addrvec_t &bind_addrs)
     ldout(cct, 10) << __func__ << " Network Stack is not ready for bind yet - postponed" << dendl;
     pending_bind_addrs = bind_addrs;
     pending_bind = true;
-    lock.Unlock();
+    lock.unlock();
     return 0;
   }
 
-  lock.Unlock();
+  lock.unlock();
 
   // bind to a socket
-  set<int> avoid_ports;
+  std::set<int> avoid_ports;
   entity_addrvec_t bound_addrs;
   unsigned i = 0;
   for (auto &&p : processors) {
@@ -412,7 +421,7 @@ int AsyncMessenger::bindv(const entity_addrvec_t &bind_addrs)
   return 0;
 }
 
-int AsyncMessenger::rebind(const set<int>& avoid_ports)
+int AsyncMessenger::rebind(const std::set<int>& avoid_ports)
 {
   ldout(cct,1) << __func__ << " rebind avoid " << avoid_ports << dendl;
   ceph_assert(did_bind);
@@ -428,7 +437,7 @@ int AsyncMessenger::rebind(const set<int>& avoid_ports)
 
   entity_addrvec_t bound_addrs;
   entity_addrvec_t bind_addrs = get_myaddrs();
-  set<int> new_avoid(avoid_ports);
+  std::set<int> new_avoid(avoid_ports);
   for (auto& a : bind_addrs.v) {
     new_avoid.insert(a.get_port());
     a.set_port(0);
@@ -455,9 +464,8 @@ int AsyncMessenger::client_bind(const entity_addr_t &bind_addr)
 {
   if (!cct->_conf->ms_bind_before_connect)
     return 0;
-  Mutex::Locker l(lock);
+  std::lock_guard l{lock};
   if (did_bind) {
-    ceph_assert(my_addrs->legacy_addr() == bind_addr);
     return 0;
   }
   if (started) {
@@ -495,9 +503,27 @@ void AsyncMessenger::_finish_bind(const entity_addrvec_t& bind_addrs,
   did_bind = true;
 }
 
+int AsyncMessenger::client_reset()
+{
+  mark_down_all();
+
+  std::scoped_lock l{lock};
+  // adjust the nonce; we want our entity_addr_t to be truly unique.
+  nonce += 1000000;
+  ldout(cct, 10) << __func__ << " new nonce " << nonce << dendl;
+
+  entity_addrvec_t newaddrs = *my_addrs;
+  for (auto& a : newaddrs.v) {
+    a.set_nonce(nonce);
+  }
+  set_myaddrs(newaddrs);
+  _init_local_connection();
+  return 0;
+}
+
 int AsyncMessenger::start()
 {
-  lock.Lock();
+  std::scoped_lock l{lock};
   ldout(cct,1) << __func__ << " start" << dendl;
 
   // register at least one entity, first!
@@ -516,22 +542,19 @@ int AsyncMessenger::start()
     _init_local_connection();
   }
 
-  lock.Unlock();
   return 0;
 }
 
 void AsyncMessenger::wait()
 {
-  lock.Lock();
-  if (!started) {
-    lock.Unlock();
-    return;
+  {
+    std::unique_lock locker{lock};
+    if (!started) {
+      return;
+    }
+    if (!stopped)
+      stop_cond.wait(locker);
   }
-  if (!stopped)
-    stop_cond.Wait(lock);
-
-  lock.Unlock();
-
   dispatch_queue.shutdown();
   if (dispatch_queue.is_started()) {
     ldout(cct, 10) << __func__ << ": waiting for dispatch queue" << dendl;
@@ -549,21 +572,21 @@ void AsyncMessenger::wait()
   started = false;
 }
 
-void AsyncMessenger::add_accept(Worker *w, ConnectedSocket cli_socket, entity_addr_t &addr)
+void AsyncMessenger::add_accept(Worker *w, ConnectedSocket cli_socket,
+				const entity_addr_t &listen_addr,
+				const entity_addr_t &peer_addr)
 {
-  lock.Lock();
-  AsyncConnectionRef conn = new AsyncConnection(cct, this, &dispatch_queue, w,
-						addr.is_msgr2(), false);
-  conn->accept(std::move(cli_socket), addr);
+  std::lock_guard l{lock};
+  auto conn = ceph::make_ref<AsyncConnection>(cct, this, &dispatch_queue, w,
+						listen_addr.is_msgr2(), false);
+  conn->accept(std::move(cli_socket), listen_addr, peer_addr);
   accepting_conns.insert(conn);
-  lock.Unlock();
 }
 
 AsyncConnectionRef AsyncMessenger::create_connect(
-  const entity_addrvec_t& addrs, int type)
+  const entity_addrvec_t& addrs, int type, bool anon)
 {
-  ceph_assert(lock.is_locked());
-  ceph_assert(addrs != *my_addrs);
+  ceph_assert(ceph_mutex_is_locked(lock));
 
   ldout(cct, 10) << __func__ << " " << addrs
       << ", creating connection and registering" << dendl;
@@ -578,53 +601,74 @@ AsyncConnectionRef AsyncMessenger::create_connect(
     // FIXME: for ipv4 vs ipv6, check whether local host can handle ipv6 before
     // trying it?  for now, just pick whichever is listed first.
     target = a;
+    break;
   }
 
   // create connection
   Worker *w = stack->get_worker();
-  AsyncConnectionRef conn = new AsyncConnection(cct, this, &dispatch_queue, w,
+  auto conn = ceph::make_ref<AsyncConnection>(cct, this, &dispatch_queue, w,
 						target.is_msgr2(), false);
+  conn->anon = anon;
   conn->connect(addrs, type, target);
-  ceph_assert(!conns.count(addrs));
-  conns[addrs] = conn;
+  if (anon) {
+    anon_conns.insert(conn);
+  } else {
+    ceph_assert(!conns.count(addrs));
+    ldout(cct, 10) << __func__ << " " << conn << " " << addrs << " "
+		   << *conn->peer_addrs << dendl;
+    conns[addrs] = conn;
+  }
   w->get_perf_counter()->inc(l_msgr_active_connections);
 
   return conn;
 }
 
-ConnectionRef AsyncMessenger::connect_to(int type, const entity_addrvec_t& addrs)
-{
-  Mutex::Locker l(lock);
-  if (*my_addrs == addrs) {
-    // local
-    return local_connection;
-  }
-
-  AsyncConnectionRef conn = _lookup_conn(addrs);
-  if (conn) {
-    ldout(cct, 10) << __func__ << " " << addrs << " existing " << conn << dendl;
-  } else {
-    conn = create_connect(addrs, type);
-    ldout(cct, 10) << __func__ << " " << addrs << " new " << conn << dendl;
-  }
-
-  return conn;
-}
 
 ConnectionRef AsyncMessenger::get_loopback_connection()
 {
   return local_connection;
 }
 
-int AsyncMessenger::_send_to(Message *m, int type, const entity_addrvec_t& addrs)
+bool AsyncMessenger::should_use_msgr2()
+{
+  // if we are bound to v1 only, and we are connecting to a v2 peer,
+  // we cannot use the peer's v2 address. otherwise the connection
+  // is assymetrical, because they would have to use v1 to connect
+  // to us, and we would use v2, and connection race detection etc
+  // would totally break down (among other things).  or, the other
+  // end will be confused that we advertise ourselve with a v1
+  // address only (that we bound to) but connected with protocol v2.
+  return !did_bind || get_myaddrs().has_msgr2();
+}
+
+entity_addrvec_t AsyncMessenger::_filter_addrs(const entity_addrvec_t& addrs)
+{
+  if (!should_use_msgr2()) {
+    ldout(cct, 10) << __func__ << " " << addrs << " limiting to v1 ()" << dendl;
+    entity_addrvec_t r;
+    for (auto& i : addrs.v) {
+      if (i.is_msgr2()) {
+	continue;
+      }
+      r.v.push_back(i);
+    }
+    return r;
+  } else {
+    return addrs;
+  }
+}
+
+int AsyncMessenger::send_to(Message *m, int type, const entity_addrvec_t& addrs)
 {
   FUNCTRACE(cct);
   ceph_assert(m);
 
+#if defined(WITH_EVENTTRACE)
   if (m->get_type() == CEPH_MSG_OSD_OP)
     OID_EVENT_TRACE(((MOSDOp *)m)->get_oid().name.c_str(), "SEND_MSG_OSD_OP");
   else if (m->get_type() == CEPH_MSG_OSD_OPREPLY)
     OID_EVENT_TRACE(((MOSDOpReply *)m)->get_oid().name.c_str(), "SEND_MSG_OSD_OP_REPLY");
+#endif
 
   ldout(cct, 1) << __func__ << "--> " << ceph_entity_type_name(type) << " "
       << addrs << " -- " << *m << " -- ?+"
@@ -637,15 +681,6 @@ int AsyncMessenger::_send_to(Message *m, int type, const entity_addrvec_t& addrs
     return -EINVAL;
   }
 
-  AsyncConnectionRef conn = _lookup_conn(addrs);
-  submit_message(m, conn, addrs, type);
-  return 0;
-}
-
-void AsyncMessenger::submit_message(Message *m, AsyncConnectionRef con,
-                                    const entity_addrvec_t& dest_addrs,
-				    int dest_type)
-{
   if (cct->_conf->ms_dump_on_send) {
     m->encode(-1, MSG_CRC_ALL);
     ldout(cct, 0) << __func__ << " submit_message " << *m << "\n";
@@ -658,32 +693,38 @@ void AsyncMessenger::submit_message(Message *m, AsyncConnectionRef con,
     m->clear_payload();
   }
 
-  // existing connection?
-  if (con) {
-    con->send_message(m);
-    return ;
+  connect_to(type, addrs, false)->send_message(m);
+  return 0;
+}
+
+ConnectionRef AsyncMessenger::connect_to(int type,
+					 const entity_addrvec_t& addrs,
+					 bool anon, bool not_local_dest)
+{
+  if (!not_local_dest) {
+    if (*my_addrs == addrs ||
+	(addrs.v.size() == 1 &&
+	 my_addrs->contains(addrs.front()))) {
+      // local
+      return local_connection;
+    }
   }
 
-  // local?
-  if (*my_addrs == dest_addrs) {
-    // local
-    local_connection->send_message(m);
-    return ;
+  auto av = _filter_addrs(addrs);
+  std::lock_guard l{lock};
+  if (anon) {
+    return create_connect(av, type, anon);
   }
 
-  // remote, no existing connection.
-  const Policy& policy = get_policy(dest_type);
-  if (policy.server) {
-    ldout(cct, 20) << __func__ << " " << *m << " remote, " << dest_addrs
-        << ", lossy server for target type "
-        << ceph_entity_type_name(dest_type) << ", no session, dropping." << dendl;
-    m->put();
+  AsyncConnectionRef conn = _lookup_conn(av);
+  if (conn) {
+    ldout(cct, 10) << __func__ << " " << av << " existing " << conn << dendl;
   } else {
-    ldout(cct,20) << __func__ << " " << *m << " remote, " << dest_addrs
-		  << ", new connection." << dendl;
-    con = create_connect(dest_addrs, dest_type);
-    con->send_message(m);
+    conn = create_connect(av, type, false);
+    ldout(cct, 10) << __func__ << " " << av << " new " << conn << dendl;
   }
+
+  return conn;
 }
 
 /**
@@ -692,19 +733,23 @@ void AsyncMessenger::submit_message(Message *m, AsyncConnectionRef con,
  */
 bool AsyncMessenger::set_addr_unknowns(const entity_addrvec_t &addrs)
 {
+  ldout(cct,1) << __func__ << " " << addrs << dendl;
   bool ret = false;
-  Mutex::Locker l(lock);
+  std::lock_guard l{lock};
 
   entity_addrvec_t newaddrs = *my_addrs;
   for (auto& a : newaddrs.v) {
     if (a.is_blank_ip()) {
+      int type = a.get_type();
       int port = a.get_port();
+      uint32_t nonce = a.get_nonce();
       for (auto& b : addrs.v) {
-	if (a.get_type() == b.get_type() &&
-	    a.get_family() == b.get_family()) {
+	if (a.get_family() == b.get_family()) {
 	  ldout(cct,1) << __func__ << " assuming my addr " << a
 		       << " matches provided addr " << b << dendl;
 	  a = b;
+	  a.set_nonce(nonce);
+	  a.set_type(type);
 	  a.set_port(port);
 	  ret = true;
 	  break;
@@ -716,12 +761,13 @@ bool AsyncMessenger::set_addr_unknowns(const entity_addrvec_t &addrs)
   if (ret) {
     _init_local_connection();
   }
+  ldout(cct,1) << __func__ << " now " << *my_addrs << dendl;
   return ret;
 }
 
 void AsyncMessenger::set_addrs(const entity_addrvec_t &addrs)
 {
-  Mutex::Locker l(lock);
+  std::lock_guard l{lock};
   auto t = addrs;
   for (auto& a : t.v) {
     a.set_nonce(nonce);
@@ -733,47 +779,48 @@ void AsyncMessenger::set_addrs(const entity_addrvec_t &addrs)
 void AsyncMessenger::shutdown_connections(bool queue_reset)
 {
   ldout(cct,1) << __func__ << " " << dendl;
-  lock.Lock();
-  for (set<AsyncConnectionRef>::iterator q = accepting_conns.begin();
-       q != accepting_conns.end(); ++q) {
-    AsyncConnectionRef p = *q;
-    ldout(cct, 5) << __func__ << " accepting_conn " << p.get() << dendl;
-    p->stop(queue_reset);
+  std::lock_guard l{lock};
+  for (const auto& c : accepting_conns) {
+    ldout(cct, 5) << __func__ << " accepting_conn " << c << dendl;
+    c->stop(queue_reset);
   }
   accepting_conns.clear();
 
-  while (!conns.empty()) {
-    auto it = conns.begin();
-    AsyncConnectionRef p = it->second;
-    ldout(cct, 5) << __func__ << " mark down " << it->first << " " << p << dendl;
-    conns.erase(it);
-    p->get_perf_counter()->dec(l_msgr_active_connections);
-    p->stop(queue_reset);
+  for (const auto& [e, c] : conns) {
+    ldout(cct, 5) << __func__ << " mark down " << e << " " << c << dendl;
+    c->get_perf_counter()->dec(l_msgr_active_connections);
+    c->stop(queue_reset);
   }
+  conns.clear();
+
+  for (const auto& c : anon_conns) {
+    ldout(cct, 5) << __func__ << " mark down " << c << dendl;
+    c->get_perf_counter()->dec(l_msgr_active_connections);
+    c->stop(queue_reset);
+  }
+  anon_conns.clear();
 
   {
-    Mutex::Locker l(deleted_lock);
-    while (!deleted_conns.empty()) {
-      set<AsyncConnectionRef>::iterator it = deleted_conns.begin();
-      AsyncConnectionRef p = *it;
-      ldout(cct, 5) << __func__ << " delete " << p << dendl;
-      deleted_conns.erase(it);
+    std::lock_guard l{deleted_lock};
+    if (cct->_conf->subsys.should_gather<ceph_subsys_ms, 5>()) {
+      for (const auto& c : deleted_conns) {
+        ldout(cct, 5) << __func__ << " delete " << c << dendl;
+      }
     }
+    deleted_conns.clear();
   }
-  lock.Unlock();
 }
 
 void AsyncMessenger::mark_down_addrs(const entity_addrvec_t& addrs)
 {
-  lock.Lock();
-  AsyncConnectionRef p = _lookup_conn(addrs);
-  if (p) {
-    ldout(cct, 1) << __func__ << " " << addrs << " -- " << p << dendl;
-    p->stop(true);
+  std::lock_guard l{lock};
+  const AsyncConnectionRef& conn = _lookup_conn(addrs);
+  if (conn) {
+    ldout(cct, 1) << __func__ << " " << addrs << " -- " << conn << dendl;
+    conn->stop(true);
   } else {
     ldout(cct, 1) << __func__ << " " << addrs << " -- connection dne" << dendl;
   }
-  lock.Unlock();
 }
 
 int AsyncMessenger::get_proto_version(int peer_type, bool connect) const
@@ -795,7 +842,38 @@ int AsyncMessenger::get_proto_version(int peer_type, bool connect) const
   return 0;
 }
 
-void AsyncMessenger::learned_addr(const entity_addr_t &peer_addr_for_me)
+int AsyncMessenger::accept_conn(const AsyncConnectionRef& conn)
+{
+  std::lock_guard l{lock};
+  if (conn->policy.server &&
+      conn->policy.lossy &&
+      !conn->policy.register_lossy_clients) {
+    anon_conns.insert(conn);
+    conn->get_perf_counter()->inc(l_msgr_active_connections);
+    return 0;
+  }
+  auto it = conns.find(*conn->peer_addrs);
+  if (it != conns.end()) {
+    auto& existing = it->second;
+
+    // lazy delete, see "deleted_conns"
+    // If conn already in, we will return 0
+    std::lock_guard l{deleted_lock};
+    if (deleted_conns.erase(existing)) {
+      conns.erase(it);
+    } else if (conn != existing) {
+      return -1;
+    }
+  }
+  ldout(cct, 10) << __func__ << " " << conn << " " << *conn->peer_addrs << dendl;
+  conns[*conn->peer_addrs] = conn;
+  conn->get_perf_counter()->inc(l_msgr_active_connections);
+  accepting_conns.erase(conn);
+  return 0;
+}
+
+
+bool AsyncMessenger::learned_addr(const entity_addr_t &peer_addr_for_me)
 {
   // be careful here: multiple threads may block here, and readers of
   // my_addr do NOT hold any lock.
@@ -804,23 +882,32 @@ void AsyncMessenger::learned_addr(const entity_addr_t &peer_addr_for_me)
   // mutex.  if it is already false, we need not retake the mutex at
   // all.
   if (!need_addr)
-    return ;
-  lock.Lock();
+    return false;
+  std::lock_guard l(lock);
   if (need_addr) {
-    need_addr = false;
     if (my_addrs->empty()) {
       auto a = peer_addr_for_me;
+      a.set_type(entity_addr_t::TYPE_ANY);
       a.set_nonce(nonce);
+      if (!did_bind) {
+	a.set_port(0);
+      }
       set_myaddrs(entity_addrvec_t(a));
       ldout(cct,10) << __func__ << " had no addrs" << dendl;
     } else {
       // fix all addrs of the same family, regardless of type (msgr2 vs legacy)
       entity_addrvec_t newaddrs = *my_addrs;
       for (auto& a : newaddrs.v) {
-	if (a.get_family() == peer_addr_for_me.get_family()) {
+	if (a.is_blank_ip() &&
+	    a.get_family() == peer_addr_for_me.get_family()) {
 	  entity_addr_t t = peer_addr_for_me;
-	  t.set_type(a.get_type());
-	  t.set_port(a.get_port());
+	  if (!did_bind) {
+	    t.set_type(entity_addr_t::TYPE_ANY);
+	    t.set_port(0);
+	  } else {	  
+	    t.set_type(a.get_type());
+	    t.set_port(a.get_port());
+	  }
 	  t.set_nonce(a.get_nonce());
 	  ldout(cct,10) << __func__ << " " << a << " -> " << t << dendl;
 	  a = t;
@@ -831,29 +918,28 @@ void AsyncMessenger::learned_addr(const entity_addr_t &peer_addr_for_me)
     ldout(cct, 1) << __func__ << " learned my addr " << *my_addrs
 		  << " (peer_addr_for_me " << peer_addr_for_me << ")" << dendl;
     _init_local_connection();
+    need_addr = false;
+    return true;
   }
-  lock.Unlock();
+  return false;
 }
 
-int AsyncMessenger::reap_dead()
+void AsyncMessenger::reap_dead()
 {
   ldout(cct, 1) << __func__ << " start" << dendl;
-  int num = 0;
 
-  Mutex::Locker l1(lock);
-  Mutex::Locker l2(deleted_lock);
+  std::lock_guard l1{lock};
 
-  while (!deleted_conns.empty()) {
-    auto it = deleted_conns.begin();
-    AsyncConnectionRef p = *it;
-    ldout(cct, 5) << __func__ << " delete " << p << dendl;
-    auto conns_it = conns.find(p->peer_addrs);
-    if (conns_it != conns.end() && conns_it->second == p)
-      conns.erase(conns_it);
-    accepting_conns.erase(p);
-    deleted_conns.erase(it);
-    ++num;
+  {
+    std::lock_guard l2{deleted_lock};
+    for (auto& c : deleted_conns) {
+      ldout(cct, 5) << __func__ << " delete " << c << dendl;
+      auto conns_it = conns.find(*c->peer_addrs);
+      if (conns_it != conns.end() && conns_it->second == c)
+        conns.erase(conns_it);
+      accepting_conns.erase(c);
+      anon_conns.erase(c);
+    }
+    deleted_conns.clear();
   }
-
-  return num;
 }

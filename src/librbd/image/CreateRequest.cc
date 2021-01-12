@@ -2,21 +2,25 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "librbd/image/CreateRequest.h"
+#include "include/ceph_assert.h"
 #include "common/dout.h"
 #include "common/errno.h"
-#include "cls/rbd/cls_rbd_client.h"
-#include "include/ceph_assert.h"
-#include "librbd/Features.h"
-#include "librbd/Utils.h"
 #include "common/ceph_context.h"
+#include "cls/rbd/cls_rbd_client.h"
 #include "osdc/Striper.h"
+#include "librbd/Features.h"
 #include "librbd/Journal.h"
-#include "librbd/MirroringWatcher.h"
+#include "librbd/ObjectMap.h"
+#include "librbd/Utils.h"
+#include "librbd/asio/ContextWQ.h"
+#include "librbd/image/Types.h"
+#include "librbd/image/ValidatePoolRequest.h"
 #include "librbd/journal/CreateRequest.h"
 #include "librbd/journal/RemoveRequest.h"
+#include "librbd/journal/TypeTraits.h"
 #include "librbd/mirror/EnableRequest.h"
-#include "librbd/io/AioCompletion.h"
 #include "journal/Journaler.h"
+
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -31,13 +35,12 @@ using util::create_context_callback;
 
 namespace {
 
-int validate_features(CephContext *cct, uint64_t features,
-                       bool force_non_primary) {
+int validate_features(CephContext *cct, uint64_t features) {
   if (features & ~RBD_FEATURES_ALL) {
     lderr(cct) << "librbd does not support requested features." << dendl;
     return -ENOSYS;
   }
-  if ((features & RBD_FEATURE_OPERATIONS) != 0) {
+  if ((features & RBD_FEATURES_INTERNAL) != 0) {
     lderr(cct) << "cannot use internally controlled features" << dendl;
     return -EINVAL;
   }
@@ -51,13 +54,10 @@ int validate_features(CephContext *cct, uint64_t features,
     lderr(cct) << "cannot use object map without exclusive lock" << dendl;
     return -EINVAL;
   }
-  if ((features & RBD_FEATURE_JOURNALING) != 0) {
-    if ((features & RBD_FEATURE_EXCLUSIVE_LOCK) == 0) {
-      lderr(cct) << "cannot use journaling without exclusive lock" << dendl;
-      return -EINVAL;
-    }
-  } else if (force_non_primary) {
-    ceph_abort();
+  if ((features & RBD_FEATURE_JOURNALING) != 0 &&
+      (features & RBD_FEATURE_EXCLUSIVE_LOCK) == 0) {
+    lderr(cct) << "cannot use journaling without exclusive lock" << dendl;
+    return -EINVAL;
   }
 
   return 0;
@@ -70,11 +70,12 @@ int validate_striping(CephContext *cct, uint8_t order, uint64_t stripe_unit,
     lderr(cct) << "must specify both (or neither) of stripe-unit and "
                << "stripe-count" << dendl;
     return -EINVAL;
-  } else if (stripe_unit || stripe_count) {
-    if ((1ull << order) % stripe_unit || stripe_unit > (1ull << order)) {
-      lderr(cct) << "stripe unit is not a factor of the object size" << dendl;
-      return -EINVAL;
-    }
+  } else if (stripe_unit && ((1ull << order) % stripe_unit || stripe_unit > (1ull << order))) {
+    lderr(cct) << "stripe unit is not a factor of the object size" << dendl;
+    return -EINVAL;
+  } else if (stripe_unit != 0 && stripe_unit < 512) {
+    lderr(cct) << "stripe unit must be at least 512 bytes" << dendl;
+    return -EINVAL;
   }
   return 0;
 }
@@ -119,14 +120,17 @@ CreateRequest<I>::CreateRequest(const ConfigProxy& config, IoCtx &ioctx,
                                 const std::string &image_name,
                                 const std::string &image_id, uint64_t size,
                                 const ImageOptions &image_options,
+                                uint32_t create_flags,
+                                cls::rbd::MirrorImageMode mirror_image_mode,
                                 const std::string &non_primary_global_image_id,
                                 const std::string &primary_mirror_uuid,
-                                bool skip_mirror_enable,
-                                ContextWQ *op_work_queue, Context *on_finish)
+                                asio::ContextWQ *op_work_queue,
+                                Context *on_finish)
   : m_config(config), m_image_name(image_name), m_image_id(image_id),
-    m_size(size), m_non_primary_global_image_id(non_primary_global_image_id),
+    m_size(size), m_create_flags(create_flags),
+    m_mirror_image_mode(mirror_image_mode),
+    m_non_primary_global_image_id(non_primary_global_image_id),
     m_primary_mirror_uuid(primary_mirror_uuid),
-    m_skip_mirror_enable(skip_mirror_enable),
     m_op_work_queue(op_work_queue), m_on_finish(on_finish) {
 
   m_io_ctx.dup(ioctx);
@@ -135,7 +139,10 @@ CreateRequest<I>::CreateRequest(const ConfigProxy& config, IoCtx &ioctx,
   m_id_obj = util::id_obj_name(m_image_name);
   m_header_obj = util::header_name(m_image_id);
   m_objmap_name = ObjectMap<>::object_map_name(m_image_id, CEPH_NOSNAP);
-  m_force_non_primary = !non_primary_global_image_id.empty();
+  if (!non_primary_global_image_id.empty() &&
+      (m_create_flags & CREATE_FLAG_MIRROR_ENABLE_MASK) == 0) {
+    m_create_flags |= CREATE_FLAG_FORCE_MIRROR_ENABLE;
+  }
 
   if (image_options.get(RBD_IMAGE_OPTION_FEATURES, &m_features) != 0) {
     m_features = librbd::rbd_features_from_string(
@@ -154,6 +161,7 @@ CreateRequest<I>::CreateRequest(const ConfigProxy& config, IoCtx &ioctx,
   m_features |= features_set;
   m_features &= ~features_clear;
 
+  m_features &= ~RBD_FEATURES_IMPLICIT_ENABLE;
   if ((m_features & RBD_FEATURE_OBJECT_MAP) == RBD_FEATURE_OBJECT_MAP) {
       m_features |= RBD_FEATURE_FAST_DIFF;
   }
@@ -199,14 +207,11 @@ CreateRequest<I>::CreateRequest(const ConfigProxy& config, IoCtx &ioctx,
     m_features |= RBD_FEATURE_DATA_POOL;
   } else {
     m_data_pool.clear();
-    m_features &= ~RBD_FEATURE_DATA_POOL;
   }
 
   if ((m_stripe_unit != 0 && m_stripe_unit != (1ULL << m_order)) ||
       (m_stripe_count != 0 && m_stripe_count != 1)) {
     m_features |= RBD_FEATURE_STRIPINGV2;
-  } else {
-    m_features &= ~RBD_FEATURE_STRIPINGV2;
   }
 
   ldout(m_cct, 10) << "name=" << m_image_name << ", "
@@ -227,7 +232,7 @@ template<typename I>
 void CreateRequest<I>::send() {
   ldout(m_cct, 20) << dendl;
 
-  int r = validate_features(m_cct, m_features, m_force_non_primary);
+  int r = validate_features(m_cct, m_features);
   if (r < 0) {
     complete(r);
     return;
@@ -276,80 +281,23 @@ void CreateRequest<I>::validate_data_pool() {
 
   ldout(m_cct, 15) << dendl;
 
-  using klass = CreateRequest<I>;
-  librados::AioCompletion *comp =
-    create_rados_callback<klass, &klass::handle_validate_data_pool>(this);
-
-  librados::ObjectReadOperation op;
-  op.read(0, 0, nullptr, nullptr);
-
-  m_outbl.clear();
-  int r = m_data_io_ctx.aio_operate(RBD_INFO, comp, &op, &m_outbl);
-  ceph_assert(r == 0);
-  comp->release();
+  auto ctx = create_context_callback<
+    CreateRequest<I>, &CreateRequest<I>::handle_validate_data_pool>(this);
+  auto req = ValidatePoolRequest<I>::create(m_data_io_ctx, m_op_work_queue,
+                                            ctx);
+  req->send();
 }
 
 template <typename I>
 void CreateRequest<I>::handle_validate_data_pool(int r) {
   ldout(m_cct, 15) << "r=" << r << dendl;
 
-  bufferlist bl;
-  bl.append("overwrite validated");
-
-  if (r >= 0 && m_outbl.contents_equal(bl)) {
-    add_image_to_directory();
-    return;
-  } else if ((r < 0) && (r != -ENOENT)) {
-    lderr(m_cct) << "failed to read RBD info: " << cpp_strerror(r) << dendl;
-    complete(r);
-    return;
-  }
-
-  // allocate a self-managed snapshot id if this a new pool to force
-  // self-managed snapshot mode
-  // This call is executed just once per (fresh) pool, hence we do not
-  // try hard to make it asynchronous (and it's pretty safe not to cause
-  // deadlocks).
-
-  ldout(m_cct, 10) << "validating self-managed RBD snapshot support" << dendl;
-
-  uint64_t snap_id;
-  r = m_data_io_ctx.selfmanaged_snap_create(&snap_id);
   if (r == -EINVAL) {
-    lderr(m_cct) << "pool not configured for self-managed RBD snapshot support"
-                 << dendl;
+    lderr(m_cct) << "pool does not support RBD images" << dendl;
     complete(r);
     return;
   } else if (r < 0) {
-    lderr(m_cct) << "failed to allocate self-managed snapshot: "
-                 << cpp_strerror(r) << dendl;
-    complete(r);
-    return;
-  }
-
-  r = m_data_io_ctx.selfmanaged_snap_remove(snap_id);
-  if (r < 0) {
-    // we've already switched to self-managed snapshots -- no need to
-    // error out in case of failure here.
-    ldout(m_cct, 10) << "failed to release self-managed snapshot " << snap_id
-                     << ": " << cpp_strerror(r) << dendl;
-  }
-
-  ldout(m_cct, 10) << "validating overwrite support" << dendl;
-
-  bufferlist initial_bl;
-  initial_bl.append("validate");
-  r = m_data_io_ctx.write(RBD_INFO, initial_bl, initial_bl.length(), 0);
-  if (r >= 0) {
-    r = m_data_io_ctx.write(RBD_INFO, bl, bl.length(), 0);
-  }
-  if (r == -EOPNOTSUPP) {
-    lderr(m_cct) << "pool missing required overwrite support" << dendl;
-    complete(-EINVAL);
-    return;
-  } else if (r < 0) {
-    lderr(m_cct) << "failed to validate overwrite support: " << cpp_strerror(r)
-                 << dendl;
+    lderr(m_cct) << "failed to validate pool: " << cpp_strerror(r) << dendl;
     complete(r);
     return;
   }
@@ -604,7 +552,7 @@ void CreateRequest<I>::handle_object_map_resize(int r) {
 template<typename I>
 void CreateRequest<I>::fetch_mirror_mode() {
   if ((m_features & RBD_FEATURE_JOURNALING) == 0) {
-    complete(0);
+    mirror_image_enable();
     return;
   }
 
@@ -635,10 +583,10 @@ void CreateRequest<I>::handle_fetch_mirror_mode(int r) {
     return;
   }
 
-  cls::rbd::MirrorMode mirror_mode_internal = cls::rbd::MIRROR_MODE_DISABLED;
+  m_mirror_mode = cls::rbd::MIRROR_MODE_DISABLED;
   if (r == 0) {
     auto it = m_outbl.cbegin();
-    r = cls_client::mirror_mode_get_finish(&it, &mirror_mode_internal);
+    r = cls_client::mirror_mode_get_finish(&it, &m_mirror_mode);
     if (r < 0) {
       lderr(m_cct) << "Failed to retrieve mirror mode" << dendl;
 
@@ -646,21 +594,6 @@ void CreateRequest<I>::handle_fetch_mirror_mode(int r) {
       remove_object_map();
       return;
     }
-  }
-
-  // TODO: remove redundant code...
-  switch (mirror_mode_internal) {
-  case cls::rbd::MIRROR_MODE_DISABLED:
-  case cls::rbd::MIRROR_MODE_IMAGE:
-  case cls::rbd::MIRROR_MODE_POOL:
-    m_mirror_mode = static_cast<rbd_mirror_mode_t>(mirror_mode_internal);
-    break;
-  default:
-    lderr(m_cct) << "Unknown mirror mode ("
-                 << static_cast<uint32_t>(mirror_mode_internal) << ")" << dendl;
-    r = -EINVAL;
-    remove_object_map();
-    return;
   }
 
   journal_create();
@@ -674,15 +607,23 @@ void CreateRequest<I>::journal_create() {
   Context *ctx = create_context_callback<klass, &klass::handle_journal_create>(
     this);
 
+  // only link to remote primary mirror uuid if in journal-based
+  // mirroring mode
+  bool use_primary_mirror_uuid = (
+    !m_non_primary_global_image_id.empty() &&
+    m_mirror_image_mode == cls::rbd::MIRROR_IMAGE_MODE_JOURNAL);
+
   librbd::journal::TagData tag_data;
-  tag_data.mirror_uuid = (m_force_non_primary ? m_primary_mirror_uuid :
+  tag_data.mirror_uuid = (use_primary_mirror_uuid ? m_primary_mirror_uuid :
                           librbd::Journal<I>::LOCAL_MIRROR_UUID);
 
-  librbd::journal::CreateRequest<I> *req =
-    librbd::journal::CreateRequest<I>::create(
-      m_io_ctx, m_image_id, m_journal_order, m_journal_splay_width,
-      m_journal_pool, cls::journal::Tag::TAG_CLASS_NEW, tag_data,
-      librbd::Journal<I>::IMAGE_CLIENT_ID, m_op_work_queue, ctx);
+  typename journal::TypeTraits<I>::ContextWQ* context_wq;
+  Journal<>::get_work_queue(m_cct, &context_wq);
+
+  auto req = librbd::journal::CreateRequest<I>::create(
+    m_io_ctx, m_image_id, m_journal_order, m_journal_splay_width,
+    m_journal_pool, cls::journal::Tag::TAG_CLASS_NEW, tag_data,
+    librbd::Journal<I>::IMAGE_CLIENT_ID, context_wq, ctx);
   req->send();
 }
 
@@ -704,8 +645,11 @@ void CreateRequest<I>::handle_journal_create(int r) {
 
 template<typename I>
 void CreateRequest<I>::mirror_image_enable() {
-  if (((m_mirror_mode != RBD_MIRROR_MODE_POOL) && !m_force_non_primary) ||
-      m_skip_mirror_enable) {
+  auto mirror_enable_flag = (m_create_flags & CREATE_FLAG_MIRROR_ENABLE_MASK);
+
+  if ((m_mirror_mode != cls::rbd::MIRROR_MODE_POOL &&
+       mirror_enable_flag != CREATE_FLAG_FORCE_MIRROR_ENABLE) ||
+      (mirror_enable_flag == CREATE_FLAG_SKIP_MIRROR_ENABLE)) {
     complete(0);
     return;
   }
@@ -713,9 +657,10 @@ void CreateRequest<I>::mirror_image_enable() {
   ldout(m_cct, 15) << dendl;
   auto ctx = create_context_callback<
     CreateRequest<I>, &CreateRequest<I>::handle_mirror_image_enable>(this);
-  auto req = mirror::EnableRequest<I>::create(m_io_ctx, m_image_id,
-                                              m_non_primary_global_image_id,
-                                              m_op_work_queue, ctx);
+
+  auto req = mirror::EnableRequest<I>::create(
+    m_io_ctx, m_image_id, m_mirror_image_mode,
+    m_non_primary_global_image_id, true, m_op_work_queue, ctx);
   req->send();
 }
 
@@ -759,9 +704,12 @@ void CreateRequest<I>::journal_remove() {
   Context *ctx = create_context_callback<klass, &klass::handle_journal_remove>(
     this);
 
+  typename journal::TypeTraits<I>::ContextWQ* context_wq;
+  Journal<>::get_work_queue(m_cct, &context_wq);
+
   librbd::journal::RemoveRequest<I> *req =
     librbd::journal::RemoveRequest<I>::create(
-      m_io_ctx, m_image_id, librbd::Journal<I>::IMAGE_CLIENT_ID, m_op_work_queue,
+      m_io_ctx, m_image_id, librbd::Journal<I>::IMAGE_CLIENT_ID, context_wq,
       ctx);
   req->send();
 }

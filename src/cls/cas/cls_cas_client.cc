@@ -1,54 +1,65 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
+
 #include <errno.h>
 
 #include "cls/cas/cls_cas_client.h"
 #include "cls/cas/cls_cas_ops.h"
 #include "include/rados/librados.hpp"
 
-using namespace librados;
+using std::set;
+using std::string;
 
-void cls_chunk_refcount_get(librados::ObjectWriteOperation& op, const hobject_t& soid)
+using ceph::bufferlist;
+using ceph::decode;
+using ceph::encode;
+
+void cls_cas_chunk_create_or_get_ref(
+  librados::ObjectWriteOperation& op,
+  const hobject_t& soid,
+  const bufferlist& data,
+  bool verify)
 {
   bufferlist in;
-  cls_chunk_refcount_get_op call;
+  cls_cas_chunk_create_or_get_ref_op call;
+  call.source = soid;
+  if (verify) {
+    call.flags |= cls_cas_chunk_create_or_get_ref_op::FLAG_VERIFY;
+  }
+  call.data = data;
+  encode(call, in);
+  op.exec("cas", "chunk_create_or_get_ref", in);
+}
+
+void cls_cas_chunk_get_ref(
+  librados::ObjectWriteOperation& op,
+  const hobject_t& soid)
+{
+  bufferlist in;
+  cls_cas_chunk_get_ref_op call;
   call.source = soid;
   encode(call, in);
-  op.exec("refcount", "chunk_get", in);
+  op.exec("cas", "chunk_get_ref", in);
 }
 
-void cls_chunk_refcount_put(librados::ObjectWriteOperation& op, const hobject_t& soid)
+void cls_cas_chunk_put_ref(
+  librados::ObjectWriteOperation& op,
+  const hobject_t& soid)
 {
   bufferlist in;
-  cls_chunk_refcount_put_op call;
+  cls_cas_chunk_put_ref_op call;
   call.source = soid;
   encode(call, in);
-  op.exec("refcount", "chunk_put", in);
+  op.exec("cas", "chunk_put_ref", in);
 }
 
-void cls_chunk_refcount_set(librados::ObjectWriteOperation& op, set<hobject_t>& refs)
-{
-  bufferlist in;
-  cls_chunk_refcount_set_op call;
-  call.refs = refs;
-  encode(call, in);
-  op.exec("refcount", "chunk_set", in);
-}
-
-int cls_chunk_refcount_read(librados::IoCtx& io_ctx, string& oid, set<hobject_t> *refs)
+int cls_cas_references_chunk(
+  librados::IoCtx& io_ctx,
+  const string& oid,
+  const string& chunk_oid)
 {
   bufferlist in, out;
-  int r = io_ctx.exec(oid, "refcount", "chunk_read", in, out);
-  if (r < 0)
-    return r;
-
-  cls_chunk_refcount_read_ret ret;
-  try {
-    auto iter = out.cbegin();
-    decode(ret, iter);
-  } catch (buffer::error& err) {
-    return -EIO;
-  }
-
-  *refs = ret.refs;
-
+  encode(chunk_oid, in);
+  int r = io_ctx.exec(oid, "cas", "references_chunk", in, out);
   return r;
 }

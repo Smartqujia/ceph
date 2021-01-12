@@ -2,16 +2,14 @@
 
 from __future__ import absolute_import
 
-import six
-
-from .helper import DashboardTestCase, JObj, JList
+from .helper import DashboardTestCase, JList, JObj
 
 
 class ECPTest(DashboardTestCase):
 
     AUTH_ROLES = ['pool-manager']
 
-    @DashboardTestCase.RunAs('test', 'test', ['block-manager'])
+    @DashboardTestCase.RunAs('test', 'test', ['rgw-manager'])
     def test_read_access_permissions(self):
         self._get('/api/erasure_code_profile')
         self.assertStatus(403)
@@ -47,10 +45,9 @@ class ECPTest(DashboardTestCase):
             }
             if 'crush-failure-domain' in default[0]:
                 default_ecp['crush-failure-domain'] = default[0]['crush-failure-domain']
-            self.assertEqual(default[0], default_ecp)
+            self.assertSubset(default_ecp, default[0])
             get_data = self._get('/api/erasure_code_profile/default')
             self.assertEqual(get_data, default[0])
-
 
     def test_create(self):
         data = {'name': 'ecp32', 'k': 3, 'm': 2}
@@ -58,7 +55,7 @@ class ECPTest(DashboardTestCase):
         self.assertStatus(201)
 
         self._get('/api/erasure_code_profile/ecp32')
-        self.assertJsonBody({
+        self.assertJsonSubset({
             'crush-device-class': '',
             'crush-failure-domain': 'osd',
             'crush-root': 'default',
@@ -68,7 +65,6 @@ class ECPTest(DashboardTestCase):
             'name': 'ecp32',
             'plugin': 'jerasure',
             'technique': 'reed_sol_van',
-            'w': '8'
         })
 
         self.assertStatus(200)
@@ -100,12 +96,10 @@ class ECPTest(DashboardTestCase):
         self.assertStatus(204)
 
     def test_ecp_info(self):
-        self._get('/api/erasure_code_profile/_info')
+        self._get('/ui-api/erasure_code_profile/info')
         self.assertSchemaBody(JObj({
-            'names': JList(six.string_types),
-            'failure_domains': JList(six.string_types),
-            'plugins': JList(six.string_types),
-            'devices': JList(six.string_types),
-            'directory': six.string_types,
+            'names': JList(str),
+            'plugins': JList(str),
+            'directory': str,
+            'nodes': JList(JObj({}, allow_unknown=True))
         }))
-
